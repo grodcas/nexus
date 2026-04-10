@@ -46,8 +46,11 @@ _KEYWORD_PATTERNS = {
     "hey_claudia":    ["hey claudia", "hey cloudia"],
     "over_claude":    ["over claude", "over cloud", "overcloud", "overclone",
                        "over claud", "over clone", "over, claud",
-                       "over club", "overglot", "over clod", "over glob"],
-    "over_claudia":   ["over claudia", "over cloudia", "overcloudia"],
+                       "over club", "overglot", "over clod", "over glob",
+                       "claude over", "cloud over", "clod over", "cloth over",
+                       "claud over", "clone over", "club over", "glob over"],
+    "over_claudia":   ["over claudia", "over cloudia", "overcloudia",
+                       "claudia over", "cloudia over"],
     "stop_claude":    ["claude stop", "stop claude", "cloud stop", "stop cloud",
                        "claud stop", "stop claud"],
     "stop_claudia":   ["claudia stop", "stop claudia", "cloudia stop", "stop cloudia"],
@@ -301,44 +304,66 @@ def _play_with_interrupt_check(audio_bytes: bytes) -> bool:
 # Acknowledgments — pre-cached TTS phrases
 # =============================================================================
 
+GREETINGS = [
+    "Yes?",
+    "Tell me.",
+    "Go ahead.",
+    "Listening.",
+    "What do you need?",
+    "I'm here.",
+    "Ready.",
+    "Yes sir.",
+]
+
 ACKNOWLEDGMENTS = [
     "Mm, let me work on that.",
     "Noted.",
     "On it.",
-    "Got it.",
+    "Got it, cooking.",
     "Working on it.",
-    "Let me see.",
-    "Alright.",
+    "Alright, on it.",
     "Sure thing.",
     "Let me look into that.",
-    "Understood.",
+    "Understood, working.",
+    "Right away.",
 ]
 
 
 def init_ack_cache():
-    """Pre-synthesize acknowledgment phrases to disk cache."""
+    """Pre-synthesize greeting and acknowledgment phrases to disk cache."""
     os.makedirs(ACK_CACHE_DIR, exist_ok=True)
     cached = 0
-    for i, text in enumerate(ACKNOWLEDGMENTS):
-        path = os.path.join(ACK_CACHE_DIR, f"ack_{i}.wav")
-        if not os.path.exists(path):
-            try:
-                audio = _synthesize(text)
-                with open(path, "wb") as f:
-                    f.write(audio)
-                cached += 1
-            except Exception as e:
-                logger.error(f"Failed to cache ack {i}: {e}")
+    for prefix, phrases in [("greet", GREETINGS), ("ack", ACKNOWLEDGMENTS)]:
+        for i, text in enumerate(phrases):
+            path = os.path.join(ACK_CACHE_DIR, f"{prefix}_{i}.wav")
+            if not os.path.exists(path):
+                try:
+                    audio = _synthesize(text)
+                    with open(path, "wb") as f:
+                        f.write(audio)
+                    cached += 1
+                except Exception as e:
+                    logger.error(f"Failed to cache {prefix}_{i}: {e}")
     if cached:
-        logger.info(f"Cached {cached} acknowledgments")
+        logger.info(f"Cached {cached} phrases")
+
+
+def play_greeting():
+    """Play a random greeting phrase (blocking — so user hears it before speaking)."""
+    idx = random.randint(0, len(GREETINGS) - 1)
+    path = os.path.join(ACK_CACHE_DIR, f"greet_{idx}.wav")
+    if os.path.exists(path):
+        subprocess.run(["afplay", path], timeout=5)
+    else:
+        subprocess.run(["say", "Yes?"], timeout=5)
 
 
 def play_ack():
-    """Play a random acknowledgment phrase (non-blocking)."""
+    """Play a random acknowledgment phrase (blocking)."""
     idx = random.randint(0, len(ACKNOWLEDGMENTS) - 1)
     path = os.path.join(ACK_CACHE_DIR, f"ack_{idx}.wav")
     if os.path.exists(path):
-        subprocess.Popen(["afplay", path])
+        subprocess.run(["afplay", path], timeout=5)
     else:
         # Fallback
         subprocess.Popen(["say", "Got it."])

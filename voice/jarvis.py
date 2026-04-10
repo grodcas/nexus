@@ -632,6 +632,9 @@ async def main():
     try:
         await asyncio.to_thread(init_ack_cache)
         start_hotkey_listener()
+        # Pre-load Whisper so Claude mode doesn't wait 4s on first use
+        from audio import get_whisper
+        await asyncio.to_thread(get_whisper)
     except Exception as e:
         logger.warning(f"Ack cache init failed (non-fatal): {e}")
 

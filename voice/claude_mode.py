@@ -38,6 +38,8 @@ from audio import (
     strip_keyword,
     transcribe,
     speak,
+    play_greeting,
+    play_ack,
     record_speech,
 )
 from session_manager import save_session, get_session_id, load_projects
@@ -183,7 +185,9 @@ class ClaudeCodeSession:
 
         elif etype == "result":
             self.status = "done"
-            self.result_text = event.get("result", "")
+            result = event.get("result", "")
+            if result.strip():
+                self.result_text = result
             duration = event.get("duration_ms", 0)
             cost = event.get("total_cost_usd", 0)
             logger.info(f"Claude done: {duration / 1000:.1f}s, ${cost:.4f}")
@@ -337,7 +341,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
     # If there's a pending result from background work, deliver it
     if claude.status == "done" and claude.result_text:
         last_claude_output = claude.result_text
-        await asyncio.to_thread(speak, f"Connected to {project}. I have a result from earlier.")
+        await asyncio.to_thread(lambda: subprocess.run(["say", f"Connected to {project}. Result from earlier."], timeout=5))
         interrupted = await asyncio.to_thread(speak, last_claude_output)
         claude.status = "idle"
         if claude.session_id:
@@ -345,7 +349,8 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
             await asyncio.to_thread(save_session, project, session_id,
                                     last_claude_output[:100])
     else:
-        await asyncio.to_thread(speak, f"Connected to {project}. Say hey claude to start.")
+        # Quick local TTS — no API call delay
+        await asyncio.to_thread(lambda: subprocess.run(["say", f"Connected to {project}"], timeout=5))
 
     while True:
         # ── IDLE ──────────────────────────────────────────────────────
@@ -362,7 +367,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                                             last_claude_output[:100])
                 continue
 
-            audio = await asyncio.to_thread(record_speech, 1.5, 30, 5.0)
+            audio = await asyncio.to_thread(record_speech, 0.3, 5, 5.0)
             if audio is None:
                 continue
 
@@ -392,7 +397,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                     prompt = strip_keyword(remaining, "over_claude").strip()
                     if prompt:
                         logger.info(f"Single-utterance prompt: '{prompt}'")
-                        await asyncio.to_thread(speak, "On it.")
+                        await asyncio.to_thread(play_ack)
                         state = State.WAITING_CLAUDE
                         await claude.run(prompt, project_path, session_id)
                     else:
@@ -403,6 +408,8 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                     buffer = []
                     if remaining and len(remaining) > 3:
                         buffer.append(remaining)
+                    else:
+                        await asyncio.to_thread(play_greeting)
                 continue
 
             elif got_hey_claudia:
@@ -425,12 +432,14 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                     if question:
                         buffer.append(question)
                         logger.info(f"Single-utterance Claudia: '{question}'")
-                        await asyncio.to_thread(speak, "Let me check.")
+                        await asyncio.to_thread(play_ack)
                         state = State.WAITING_CLAUDIA
                     else:
                         await asyncio.to_thread(speak, "I didn't catch a question.")
                 elif remaining and len(remaining) > 3:
-                        buffer.append(remaining)
+                    buffer.append(remaining)
+                else:
+                    await asyncio.to_thread(play_greeting)
                 continue
 
             elif keyword == "jarvis":
@@ -469,7 +478,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                     state = State.IDLE
                     continue
                 logger.info(f"Multi-utterance prompt: '{prompt}'")
-                await asyncio.to_thread(speak, "On it.")
+                await asyncio.to_thread(play_ack)
                 state = State.WAITING_CLAUDE
                 await claude.run(prompt, project_path, session_id)
                 continue
@@ -558,9 +567,12 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
             question = " ".join(buffer)
             logger.info(f"Claudia: {question[:100]}")
 
+            context = last_claude_output or ""
+            logger.info(f"Claudia context: {len(context)} chars, first 80: '{context[:80]}'")
+
             try:
                 response = await asyncio.to_thread(
-                    claudia.ask, question, last_claude_output or ""
+                    claudia.ask, question, context
                 )
                 logger.info(f"Claudia response: {response[:100]}")
                 await asyncio.to_thread(speak, response)
