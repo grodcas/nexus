@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Jarvis — Personal Voice Assistant
+Jarvis — Personal Voice Assistant (Gemini mode)
 
-Voice-controlled assistant using Gemini Live for conversation,
-with background tools for coding, management, documents, and GitHub.
+Voice-controlled assistant using Gemini Live for conversation.
+Hands off to Claude mode for coding via voice/claude_mode.py.
 
 Usage:
     cd ~/nexus && source venv/bin/activate
@@ -16,7 +16,7 @@ import os
 import subprocess
 import sys
 import time
-from enum import Enum
+
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -42,6 +42,16 @@ from pipecat.transports.local.audio import (
 )
 from pipecat.turns.user_mute.always_user_mute_strategy import AlwaysUserMuteStrategy
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from audio import wait_for_wakeword, init_ack_cache, start_hotkey_listener
+from session_manager import (
+    load_projects, format_sessions_for_display, format_all_sessions,
+    close_session as close_project_session,
+)
+from claude_mode import (
+    run_claude_mode, get_all_session_statuses, kill_session, check_notifications,
+)
+
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
 
 logger.remove(0)
@@ -52,336 +62,46 @@ logger.add(sys.stderr, level="INFO")
 # Configuration
 # =============================================================================
 
-PROJECTS = {"nexus": "~/nexus"}
+PROJECTS = load_projects()
 
-_projects_file = os.path.expanduser("~/.nexus/projects.json")
-if os.path.exists(_projects_file):
-    with open(_projects_file) as f:
-        PROJECTS.update(json.load(f))
-
-SESSIONS_FILE = os.path.expanduser("~/.nexus/sessions.json")
 WORKTREE_ROOT = os.path.expanduser("~/.nexus/documents")
 MANAGEMENT_ROOT = os.path.expanduser("~/.nexus/management")
 MANAGEMENT_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "scripts", "management")
 
-IDLE_TIMEOUT = 420  # 7 minutes before disconnecting Gemini
+IDLE_TIMEOUT = 420  # 7 minutes
 
 
 # =============================================================================
-# State machine — 2 states, no confirmation
+# App state — simpler now (coding state is in claude_mode)
 # =============================================================================
-
-class AppState(Enum):
-    IDLE = "idle"       # General assistant
-    CODING = "coding"   # Connected to a project
-
 
 class App:
     def __init__(self):
-        self.state = AppState.IDLE
-        self.active_project = None
-        self.active_project_path = None
-        self.project_context = {}
-        self.claude = ClaudeSession()
         self.pipeline_task = None
+        self.llm = None
         self.last_activity = time.time()
         self.sleep_requested = False
-        self.pending_claude_result = None
-        self.llm = None
-
-
-# Forward reference — App created after ClaudeSession is defined
-
-
-# =============================================================================
-# Session persistence
-# =============================================================================
-
-def load_sessions() -> dict:
-    if os.path.exists(SESSIONS_FILE):
-        with open(SESSIONS_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def _save_sessions(sessions: dict):
-    os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
-    with open(SESSIONS_FILE, "w") as f:
-        json.dump(sessions, f, indent=2)
-
-
-def save_session(project_name: str, session_id: str):
-    sessions = load_sessions()
-    if not isinstance(sessions.get(project_name), dict):
-        sessions[project_name] = {}
-    sessions[project_name]["session_id"] = session_id
-    _save_sessions(sessions)
-
-
-def get_last_session(project_name: str) -> str | None:
-    entry = load_sessions().get(project_name, {})
-    if isinstance(entry, dict):
-        return entry.get("session_id")
-    return entry
-
-
-def save_last_result(project_name: str, result: str):
-    sessions = load_sessions()
-    if not isinstance(sessions.get(project_name), dict):
-        sessions[project_name] = {}
-    sessions[project_name]["last_result"] = result[:1000]
-    sessions[project_name]["last_result_time"] = time.strftime("%Y-%m-%d %H:%M")
-    _save_sessions(sessions)
-
-
-def get_last_result(project_name: str) -> str | None:
-    entry = load_sessions().get(project_name, {})
-    if isinstance(entry, dict):
-        result = entry.get("last_result")
-        when = entry.get("last_result_time", "")
-        if result:
-            return f"[{when}] {result}"
-    return None
-
-
-def load_project_context(project_path: str) -> dict:
-    ctx = {}
-    try:
-        r = subprocess.run(
-            ["git", "branch", "--show-current"],
-            cwd=project_path, capture_output=True, text=True, timeout=5,
-        )
-        ctx["branch"] = r.stdout.strip() if r.returncode == 0 else "unknown"
-
-        r = subprocess.run(
-            ["git", "status", "--short"],
-            cwd=project_path, capture_output=True, text=True, timeout=5,
-        )
-        ctx["git_status"] = r.stdout.strip()[:500] or "clean"
-
-        r = subprocess.run(
-            ["git", "log", "--oneline", "-5"],
-            cwd=project_path, capture_output=True, text=True, timeout=5,
-        )
-        ctx["recent_commits"] = r.stdout.strip()[:500]
-    except Exception as e:
-        ctx["error"] = str(e)
-
-    claude_md = os.path.join(project_path, "CLAUDE.md")
-    if os.path.exists(claude_md):
-        with open(claude_md) as f:
-            ctx["claude_md"] = f.read()[:1500]
-
-    return ctx
-
-
-# =============================================================================
-# Claude session manager — with kill(), auto-replace, on_complete callback
-# =============================================================================
-
-class ClaudeSession:
-    def __init__(self):
-        self.proc = None
-        self.status = "idle"  # idle | working | done | error
-        self.instruction = ""
-        self.current_action = ""
-        self.result_text = ""
-        self.started_at = 0
-        self.session_id = None
-        self._monitor_task = None
-        self._on_complete = None
-        self._events = []
-
-    @property
-    def is_busy(self):
-        return self.status == "working"
-
-    def kill(self):
-        """Kill subprocess and cancel monitor. Single cleanup entry point."""
-        if self._monitor_task and not self._monitor_task.done():
-            self._monitor_task.cancel()
-        self._monitor_task = None
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=1)
-        self.proc = None
-        self.status = "idle"
-        self.current_action = ""
-
-    async def start(self, instruction: str, repo_path: str,
-                    continue_session: bool = True, on_complete=None):
-        """Start a Claude Code task. Kills any existing task first."""
-        self.kill()
-
-        if "concise" not in instruction.lower() and "short" not in instruction.lower():
-            instruction += "\n\nKeep your final summary to 3-5 sentences."
-
-        self.instruction = instruction
-        self.status = "working"
-        self._events = []
-        self.current_action = "starting..."
-        self.result_text = ""
-        self.started_at = time.time()
-        self._on_complete = on_complete
-
-        cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json",
-               "--dangerously-skip-permissions"]
-
-        if continue_session:
-            stored = get_last_session(app.active_project) if app.active_project else None
-            if stored:
-                cmd.extend(["--resume", stored])
-            else:
-                cmd.append("--continue")
-
-        cmd.extend(["-p", instruction])
-
-        self.proc = subprocess.Popen(
-            cmd, cwd=repo_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        self._monitor_task = asyncio.create_task(self._monitor())
-        self._monitor_task.set_name(f"claude-monitor-{int(time.time())}")
-        logger.info(f"Claude started: {instruction[:100]}")
-
-    async def _monitor(self):
-        """Read Claude's stream-json output. Calls on_complete when done."""
-        try:
-            loop = asyncio.get_event_loop()
-            while self.proc and self.proc.poll() is None:
-                line = await loop.run_in_executor(None, self.proc.stdout.readline)
-                if not line:
-                    break
-                try:
-                    event = json.loads(line.decode("utf-8", errors="replace"))
-                    self._events.append(event)
-                    self._process_event(event)
-                except json.JSONDecodeError:
-                    pass
-
-            # Drain remaining output
-            if self.proc:
-                remaining = await loop.run_in_executor(None, self.proc.stdout.read)
-                if remaining:
-                    for raw_line in remaining.split(b"\n"):
-                        if raw_line.strip():
-                            try:
-                                event = json.loads(raw_line.decode("utf-8", errors="replace"))
-                                self._events.append(event)
-                                self._process_event(event)
-                            except json.JSONDecodeError:
-                                pass
-
-            if self.status == "working":
-                self.status = "done"
-                self.current_action = "finished"
-
-        except asyncio.CancelledError:
-            logger.info("Claude monitor cancelled")
-            return
-        except Exception as e:
-            self.status = "error"
-            self.current_action = f"error: {e}"
-            logger.error(f"Claude monitor error: {e}")
-        finally:
-            logger.info(f"Monitor finally: status={self.status}, has_callback={self._on_complete is not None}")
-            if self._on_complete and self.status in ("done", "error"):
-                try:
-                    await self._on_complete()
-                except Exception as e:
-                    logger.error(f"on_complete callback error: {e}")
-            elif self._on_complete:
-                logger.warning(f"on_complete skipped — status was '{self.status}'")
-
-    def _process_event(self, event):
-        etype = event.get("type", "")
-
-        if etype == "system" and event.get("subtype") == "init":
-            sid = event.get("session_id")
-            if sid:
-                self.session_id = sid
-                if app.active_project:
-                    save_session(app.active_project, sid)
-                logger.info(f"Claude session: {sid}")
-
-        elif etype == "assistant":
-            msg = event.get("message", {})
-            for block in msg.get("content", []):
-                if block.get("type") == "text":
-                    text = block.get("text", "")
-                    self.result_text = text
-                    if text.strip():
-                        self.current_action = f"thinking: {text[:80]}"
-                elif block.get("type") == "tool_use":
-                    tool = block.get("name", "?")
-                    inp = block.get("input", {})
-                    if tool == "Read":
-                        self.current_action = f"reading {inp.get('file_path', '?')}"
-                    elif tool == "Edit":
-                        self.current_action = f"editing {inp.get('file_path', '?')}"
-                    elif tool == "Write":
-                        self.current_action = f"writing {inp.get('file_path', '?')}"
-                    elif tool == "Bash":
-                        self.current_action = f"running: {inp.get('command', '?')[:50]}"
-                    elif tool == "Grep":
-                        self.current_action = f"searching: {inp.get('pattern', '?')}"
-                    elif tool == "Glob":
-                        self.current_action = f"finding: {inp.get('pattern', '?')}"
-                    else:
-                        self.current_action = f"using {tool}"
-
-        elif etype == "result":
-            self.status = "done"
-            self.result_text = event.get("result", "")
-            self.current_action = "finished"
-            duration = event.get("duration_ms", 0)
-            cost = event.get("total_cost_usd", 0)
-            logger.info(f"Claude done in {duration / 1000:.1f}s, cost ${cost:.4f}")
-
-    def get_progress(self) -> str:
-        # Health check: detect zombie process
-        if self.status == "working" and self.proc and self.proc.poll() is not None:
-            self.status = "error"
-            self.current_action = f"process died (exit {self.proc.returncode})"
-
-        if self.status == "idle":
-            return "No task running."
-
-        elapsed = int(time.time() - self.started_at)
-        tool_count = sum(
-            1 for e in self._events
-            if e.get("type") == "assistant"
-            and any(b.get("type") == "tool_use" for b in e.get("message", {}).get("content", []))
-        )
-
-        if self.status == "working":
-            return (
-                f"Working on: {self.instruction[:100]}\n"
-                f"Current: {self.current_action}\n"
-                f"Elapsed: {elapsed}s, {tool_count} operations"
-            )
-        elif self.status == "done":
-            summary = self.result_text[:500] if self.result_text else "Completed."
-            return f"Done ({elapsed}s, {tool_count} ops). Result: {summary}"
-        else:
-            return f"Error: {self.current_action}"
+        # Handoff to Claude mode
+        self.enter_claude_mode = False
+        self.claude_mode_project = None
+        self.claude_mode_session = None
+        self.claude_mode_path = None
+        # Context for Gemini after returning from Claude mode
+        self.returned_from_claude = False
+        self.returned_project = None
 
 
 app = App()
 
 
 # =============================================================================
-# Document search — single-pass, two-tier matching
+# Document search
 # =============================================================================
 
 def search_worktree(query: str) -> str:
     words = [w.lower() for w in query.split() if len(w) > 2]
     if not words:
         return f"No results for '{query}'."
-
     exact, partial = [], []
     for dirpath, _, filenames in os.walk(WORKTREE_ROOT):
         for fname in filenames:
@@ -397,17 +117,15 @@ def search_worktree(query: str) -> str:
                         partial.append(f"[{fname}] {line.strip()}")
             if len(exact) >= 15:
                 break
-
     results = exact[:15] or partial[:15]
     return "\n".join(results) if results else f"Nothing found for '{query}'."
 
 
 # =============================================================================
-# Management sync helper
+# Management sync
 # =============================================================================
 
 def _sync_management(source: str = "all") -> bool:
-    """Run sync scripts. Called via asyncio.to_thread — never blocks event loop."""
     venv_python = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "venv", "bin", "python3")
     )
@@ -444,19 +162,15 @@ def track_activity(handler):
 
 
 # =============================================================================
-# Tool handlers — 8 tools, all async-safe
+# Tool handlers — 7 tools
 # =============================================================================
 
 # ── 1. connect_project ──
 
 async def handle_connect_project(params: FunctionCallParams):
+    """Show sessions or enter Claude coding mode."""
     project = params.arguments.get("project", "").lower().strip()
-
-    if app.state == AppState.CODING:
-        await params.result_callback({
-            "result": f"Already connected to '{app.active_project}'. Disconnect first."
-        })
-        return
+    session_choice = params.arguments.get("session_choice", "")
 
     if project not in PROJECTS:
         available = ", ".join(PROJECTS.keys())
@@ -470,99 +184,65 @@ async def handle_connect_project(params: FunctionCallParams):
         await params.result_callback({"result": f"Path '{path}' not found."})
         return
 
-    ctx = await asyncio.to_thread(load_project_context, path)
-
-    app.active_project = project
-    app.active_project_path = path
-    app.project_context = ctx
-    app.state = AppState.CODING
-
-    last_result = get_last_result(project)
-
-    summary = f"Connected to '{project}'. Branch: {ctx.get('branch', '?')}."
-    if ctx.get("recent_commits"):
-        summary += f"\nRecent commits:\n{ctx['recent_commits']}"
-    if last_result:
-        summary += f"\nLast session: {last_result}"
-    if ctx.get("claude_md"):
-        summary += f"\nProject: {ctx['claude_md'][:300]}"
-
-    await params.result_callback({"result": summary})
-
-
-# ── 2. disconnect_project ──
-
-async def handle_disconnect_project(params: FunctionCallParams):
-    if app.state != AppState.CODING:
-        await params.result_callback({"result": "Not connected to a project."})
+    # If no session_choice, show available sessions
+    if not session_choice:
+        info = await asyncio.to_thread(format_sessions_for_display, project)
+        active = get_all_session_statuses()
+        if project in active:
+            info += f"\nNote: Claude is currently {active[project]} on this project."
+        await params.result_callback({"result": info})
         return
 
-    old = app.active_project
-    app.claude.kill()
-    app.active_project = None
-    app.active_project_path = None
-    app.project_context = {}
-    app.claude = ClaudeSession()
-    app.state = AppState.IDLE
+    # With session_choice — trigger handoff to Claude mode
+    app.enter_claude_mode = True
+    app.claude_mode_project = project
+    app.claude_mode_session = session_choice
+    app.claude_mode_path = path
 
-    await params.result_callback({"result": f"Disconnected from '{old}'."})
-
-
-# ── 3. coding_task ──
-
-async def handle_coding_task(params: FunctionCallParams):
-    if app.state != AppState.CODING:
-        await params.result_callback({
-            "result": "Not connected to a project. Say 'connect to <project>' first."
-        })
-        return
-
-    instruction = params.arguments.get("instruction", "")
-    fresh = params.arguments.get("fresh_session", False)
-
-    async def on_complete():
-        result = app.claude.get_progress()
-        if app.active_project:
-            await asyncio.to_thread(save_last_result, app.active_project, result)
-        app.pending_claude_result = result
-        logger.info("Claude done — result saved, Gemini will reconnect to deliver")
-
-    await app.claude.start(
-        instruction, app.active_project_path,
-        continue_session=not fresh, on_complete=on_complete,
-    )
-
-    await asyncio.sleep(1.5)
-    progress = app.claude.get_progress()
     await params.result_callback({
-        "result": f"Task started. I'll disconnect now and come back when it's done. {progress}"
+        "result": f"Switching to Claude coding mode for '{project}'. Goodbye for now."
     })
 
-    # Disconnect Gemini — Claude runs in background.
-    # Main loop will reconnect when pending_claude_result appears.
-    await asyncio.sleep(3)  # Let Gemini speak the response first
+    # End Gemini pipeline after response plays
+    await asyncio.sleep(3)
     if app.pipeline_task:
         await app.pipeline_task.queue_frames([EndFrame()])
 
 
-# ── 4. check_progress ──
+# ── 2. list_sessions ──
 
-async def handle_check_progress(params: FunctionCallParams):
-    if app.state != AppState.CODING:
+async def handle_list_sessions(params: FunctionCallParams):
+    """List all sessions across projects."""
+    info = await asyncio.to_thread(format_all_sessions)
+    active = get_all_session_statuses()
+    if active:
+        active_str = ", ".join(f"{p}: {s}" for p, s in active.items())
+        info += f"\nActive tasks: {active_str}"
+    await params.result_callback({"result": info})
+
+
+# ── 3. close_session ──
+
+async def handle_close_session(params: FunctionCallParams):
+    """Close a project's coding session."""
+    project = params.arguments.get("project", "").lower().strip()
+
+    if project not in PROJECTS:
         available = ", ".join(PROJECTS.keys())
         await params.result_callback({
-            "result": f"Not connected to a project. Available: {available}"
+            "result": f"Unknown project '{project}'. Available: {available}"
         })
         return
 
-    parts = [f"Project: {app.active_project} ({app.active_project_path})"]
-    parts.append(f"Branch: {app.project_context.get('branch', '?')}")
-    parts.append(app.claude.get_progress())
-
-    await params.result_callback({"result": "\n".join(parts)})
+    kill_session(project)
+    await asyncio.to_thread(close_project_session, project)
+    await params.result_callback({"result": f"Session closed for '{project}'."})
 
 
-# ── 5. management ──
+# ── 4. management ──
+
+MAX_TOOL_RESULT = 4000  # Failsafe — Gemini chokes on very large tool results
+
 
 async def handle_management(params: FunctionCallParams):
     source = params.arguments.get("source", "all")
@@ -581,23 +261,28 @@ async def handle_management(params: FunctionCallParams):
         data = await asyncio.to_thread(_read_management_file, filename.get(source, "root.md"))
         prefix = f"User asked: '{query}'\nAnswer concisely based on this data.\n\n"
 
-    await params.result_callback({"result": prefix + data})
+    result = prefix + data
+    if len(result) > MAX_TOOL_RESULT:
+        result = result[:MAX_TOOL_RESULT] + "\n\n[Truncated — data too long for voice]"
+        logger.info(f"Management result truncated to {MAX_TOOL_RESULT} chars")
 
-
-# ── 6. search_documents ──
-
-async def handle_search_documents(params: FunctionCallParams):
-    query = params.arguments.get("query", "")
-    logger.info(f"Doc search: {query}")
-    result = await asyncio.to_thread(search_worktree, query)
     await params.result_callback({"result": result})
 
 
-# ── 7. github ──
+# ── 5. search_documents ──
+
+async def handle_search_documents(params: FunctionCallParams):
+    query = params.arguments.get("query", "")
+    result = await asyncio.to_thread(search_worktree, query)
+    if len(result) > MAX_TOOL_RESULT:
+        result = result[:MAX_TOOL_RESULT] + "\n[Truncated]"
+    await params.result_callback({"result": result})
+
+
+# ── 6. github ──
 
 async def handle_github(params: FunctionCallParams):
     query = params.arguments.get("query", "")
-    logger.info(f"GitHub: {query}")
 
     def _fetch():
         parts = []
@@ -612,7 +297,6 @@ async def handle_github(params: FunctionCallParams):
         except Exception as e:
             parts.append(f"Error: {e}")
 
-        # Get commits for specific project if mentioned
         for proj_name, proj_path in PROJECTS.items():
             if proj_name in query.lower():
                 path = os.path.expanduser(proj_path)
@@ -635,7 +319,7 @@ async def handle_github(params: FunctionCallParams):
     })
 
 
-# ── 8. sleep ──
+# ── 7. sleep ──
 
 async def handle_sleep(params: FunctionCallParams):
     await params.result_callback({"result": "Going to sleep. Say 'hey jarvis' when you need me."})
@@ -646,7 +330,7 @@ async def handle_sleep(params: FunctionCallParams):
 
 
 # =============================================================================
-# Tool schema — 8 tools
+# Tool schema — 7 tools
 # =============================================================================
 
 TOOLS = [
@@ -654,10 +338,28 @@ TOOLS = [
         "function_declarations": [
             {
                 "name": "connect_project",
-                "description": (
-                    "Connect to a coding project. Use when user says "
-                    "'connect to X', 'let's work on X', 'open X'. Connects immediately."
-                ),
+                "description": "Connect to a project for coding. Say 'connect to X'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string", "description": "Project name"},
+                        "session_choice": {
+                            "type": "string",
+                            "enum": ["last", "previous", "new"],
+                            "description": "Which session. Omit to show options.",
+                        },
+                    },
+                    "required": ["project"],
+                },
+            },
+            {
+                "name": "list_sessions",
+                "description": "List coding sessions across projects.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "close_session",
+                "description": "Close a coding session for a project.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -667,101 +369,45 @@ TOOLS = [
                 },
             },
             {
-                "name": "disconnect_project",
-                "description": (
-                    "Disconnect from the current coding project. "
-                    "Use when user says 'exit', 'disconnect', 'leave project', 'close project'."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-            {
-                "name": "coding_task",
-                "description": (
-                    "Send a task to the background coding agent. Only works when connected to a project. "
-                    "If a task is already running, it will be stopped and replaced. "
-                    "Write a clear, detailed instruction. Set fresh_session=true only for unrelated new work."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "instruction": {
-                            "type": "string",
-                            "description": "Detailed task instruction for the coding agent.",
-                        },
-                        "fresh_session": {
-                            "type": "boolean",
-                            "description": "True = new session. False = continue previous context (default).",
-                        },
-                    },
-                    "required": ["instruction"],
-                },
-            },
-            {
-                "name": "check_progress",
-                "description": (
-                    "Check the coding agent's status and project info. "
-                    "Use when user asks 'how's it going', 'is it done', 'what's the status'."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-            {
                 "name": "management",
-                "description": (
-                    "Access calendar, reminders, or email. Syncs live data (takes 5-15s). "
-                    "Use source='all' for a full daily briefing. "
-                    "Use for 'morning briefing', 'any meetings', 'what's due', 'any emails'."
-                ),
+                "description": "Access calendar, reminders, or email.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "source": {
                             "type": "string",
                             "enum": ["all", "calendar", "reminders", "email"],
-                            "description": "Which source to check.",
                         },
-                        "query": {
-                            "type": "string",
-                            "description": "What the user asked.",
-                        },
+                        "query": {"type": "string"},
                     },
                     "required": ["source"],
                 },
             },
             {
                 "name": "search_documents",
-                "description": (
-                    "Search the user's 14K+ document archive by keywords. "
-                    "Use for 'find my document about X', 'do I have notes on X'."
-                ),
+                "description": "Search document archive by keywords.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "Search keywords."},
+                        "query": {"type": "string"},
                     },
                     "required": ["query"],
                 },
             },
             {
                 "name": "github",
-                "description": (
-                    "Check GitHub activity: recent repos, commits. "
-                    "Use for 'what did I last commit', 'recent activity', 'repo status'."
-                ),
+                "description": "Check GitHub repos and commits.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string", "description": "The GitHub question."},
+                        "query": {"type": "string"},
                     },
                     "required": ["query"],
                 },
             },
             {
                 "name": "sleep",
-                "description": (
-                    "Go to sleep — disconnect and wait for 'hey jarvis' wake word. "
-                    "Use when user says 'sleep', 'goodbye', 'go to sleep', 'that's all', "
-                    "'hold on', 'wait', 'pause'."
-                ),
+                "description": "Go to sleep. Say 'sleep' or 'goodbye'.",
                 "parameters": {"type": "object", "properties": {}},
             },
         ]
@@ -770,85 +416,27 @@ TOOLS = [
 
 
 # =============================================================================
-# System prompt — identity-first, concise
+# System prompt
 # =============================================================================
 
 SYSTEM_PROMPT = """\
-You are Jarvis, a personal assistant. Sharp, friendly, concise. You speak naturally.
-
-Tools: coding (connect to project + delegate), management (calendar/reminders/email), \
-documents (search 14K files), github (repo info).
+You are Jarvis, a personal assistant. Sharp, friendly, concise.
 
 Rules:
-- ALWAYS say something before calling a tool. "Let me check..." Never go silent.
-- When a tool returns data, READ IT BACK to the user almost verbatim. Do not rephrase, \
-  interpret, or summarize unless the user asks. You are a voice layer — pass the information \
-  through with natural speech flow. Add a brief intro ("Here's what I found", "Done") and \
-  read the content.
-- For coding tasks: pass the user's request to the coding agent. When results come back, \
-  read them directly. Do not add your own interpretation of code.
-- When translating a user request into a coding_task instruction, ENHANCE it: add specificity \
-  and context. But the result comes back raw — just read it.
-- You can answer other questions while a coding task runs.
+- ALWAYS say something before calling a tool. Never go silent.
+- When a tool returns data, summarize the key points in 2-4 spoken sentences. Do not read raw data.
+- Keep ALL responses under 25 seconds of speech. Be brief. If there is too much data, give the highlights and ask if the user wants more detail.
+- For briefings: top 3 items only, one sentence each.
 
 Available projects: {projects}
 """
 
 
 # =============================================================================
-# Wake word detection — openwakeword "hey jarvis"
+# Wake word detection — reused from audio.py
 # =============================================================================
 
 WAKEWORD_THRESHOLD = 0.7
-_oww_model = None
-
-
-def _get_oww_model():
-    global _oww_model
-    if _oww_model is None:
-        from openwakeword.model import Model
-        _oww_model = Model(
-            wakeword_models=["alexa"],
-            inference_framework="onnx",
-        )
-        logger.info("OpenWakeWord loaded (alexa)")
-    return _oww_model
-
-
-def wait_for_wakeword(timeout: float = 0):
-    """Block until 'hey jarvis' detected. timeout=0 waits forever."""
-    import numpy as np
-    import pyaudio
-
-    CHUNK = 1280  # 80ms @ 16kHz
-    RATE = 16000
-
-    oww = _get_oww_model()
-    oww.reset()
-
-    p = pyaudio.PyAudio()
-    stream = p.open(
-        format=pyaudio.paInt16, channels=1, rate=RATE,
-        input=True, frames_per_buffer=CHUNK,
-    )
-
-    start = time.time()
-    try:
-        while True:
-            if timeout > 0 and (time.time() - start) > timeout:
-                return False
-            data = stream.read(CHUNK, exception_on_overflow=False)
-            audio = np.frombuffer(data, dtype=np.int16)
-            prediction = oww.predict(audio)
-            for name, score in prediction.items():
-                if score >= WAKEWORD_THRESHOLD:
-                    logger.info(f"Wake word: '{name}' ({score:.3f})")
-                    oww.reset()
-                    return True
-    finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
 
 
 # =============================================================================
@@ -874,12 +462,11 @@ async def run_pipeline_session(is_first: bool = False):
         ),
     )
 
-    # Register 8 tools
-    llm.register_function("connect_project", track_activity(handle_connect_project))
-    llm.register_function("disconnect_project", track_activity(handle_disconnect_project))
-    llm.register_function("coding_task", track_activity(handle_coding_task),
-                          cancel_on_interruption=False, timeout_secs=30)
-    llm.register_function("check_progress", track_activity(handle_check_progress))
+    # Register 7 tools
+    llm.register_function("connect_project", track_activity(handle_connect_project),
+                          cancel_on_interruption=False, timeout_secs=15)
+    llm.register_function("list_sessions", track_activity(handle_list_sessions))
+    llm.register_function("close_session", track_activity(handle_close_session))
     llm.register_function("management", track_activity(handle_management),
                           cancel_on_interruption=False, timeout_secs=60)
     llm.register_function("search_documents", track_activity(handle_search_documents),
@@ -892,29 +479,23 @@ async def run_pipeline_session(is_first: bool = False):
     # Build initial context
     if is_first:
         initial_msg = "Greet the user. You just started up. Be brief — one sentence."
-    elif app.pending_claude_result:
-        result = app.pending_claude_result
-        app.pending_claude_result = None
-        # Extract just the result text, skip metadata (instruction, elapsed, ops)
-        lines = result.split("\n")
-        # Find "Result:" line if present, else take last meaningful line
-        short = result[:200]
-        for line in lines:
-            if line.startswith("Result:"):
-                short = line[7:].strip()[:200]
-                break
-        initial_msg = f"Task done. Read this to the user: {short}"
-    elif app.state == AppState.CODING:
+    elif app.returned_from_claude:
+        app.returned_from_claude = False
+        proj = app.returned_project or "a project"
+        active = get_all_session_statuses()
+        status_info = ""
+        if proj in active:
+            status_info = f" Claude is still {active[proj]} on it."
         initial_msg = (
-            f"The user is back. Connected to project '{app.active_project}'. "
-            "Acknowledge briefly."
+            f"The user just came back from coding on '{proj}'.{status_info} "
+            "Welcome them back briefly and ask what they need."
         )
     else:
         initial_msg = "The user just said 'hey jarvis'. Acknowledge briefly — you're ready."
 
     context = LLMContext([{"role": "user", "content": initial_msg}])
     user_params = LLMUserAggregatorParams(
-        user_mute_strategies=[],
+        user_mute_strategies=[AlwaysUserMuteStrategy()],
         vad_analyzer=SileroVADAnalyzer(),
     )
     user_agg, assistant_agg = LLMContextAggregatorPair(context, user_params=user_params)
@@ -939,44 +520,40 @@ async def run_pipeline_session(is_first: bool = False):
 
     session_stop = asyncio.Event()
 
-    has_pending_result = app.pending_claude_result is not None or (
-        not is_first and "Coding task done" in initial_msg
-    )
-
     async def start_conversation():
         await asyncio.sleep(1)
-        logger.info(f"Triggering conversation. Initial msg: {initial_msg[:80]}")
+        logger.info(f"Triggering conversation: {initial_msg[:80]}")
         await task.queue_frames([LLMRunFrame()])
 
-        # For pending results, also inject via send_client_content as backup
-        # in case LLMContext initial message doesn't trigger speech
-        if has_pending_result:
-            await asyncio.sleep(3)
-            try:
-                if llm._session and not llm._disconnecting:
-                    from google.genai.types import Content, Part
-                    msg = Content(
-                        role="user",
-                        parts=[Part(text=initial_msg)]
-                    )
-                    await llm._session.send_client_content(
-                        turns=[msg], turn_complete=True
-                    )
-                    logger.info("Backup result delivery via send_client_content")
-            except Exception as e:
-                logger.error(f"Backup delivery failed: {e}")
-
     async def keepalive():
-        from google.genai.types import Blob
+        from google.genai.types import Blob, Content, Part
         silent = Blob(data=b"\x00" * 320, mime_type="audio/pcm;rate=16000")
+        last_connection_id = id(llm._session) if llm._session else None
+
         while not session_stop.is_set():
             try:
-                await asyncio.wait_for(session_stop.wait(), timeout=20)
+                await asyncio.wait_for(session_stop.wait(), timeout=10)
                 break
             except asyncio.TimeoutError:
                 pass
             try:
                 if llm._session and not llm._disconnecting:
+                    # Detect reconnection — session object changed
+                    current_id = id(llm._session)
+                    if last_connection_id and current_id != last_connection_id:
+                        logger.info("Reconnection detected — re-prompting Gemini")
+                        try:
+                            msg = Content(
+                                role="user",
+                                parts=[Part(text="You just reconnected. Say 'I'm back' briefly.")]
+                            )
+                            await llm._session.send_client_content(
+                                turns=[msg], turn_complete=True,
+                            )
+                        except Exception as e:
+                            logger.error(f"Re-prompt failed: {e}")
+                    last_connection_id = current_id
+
                     await llm._session.send_realtime_input(audio=silent)
             except Exception:
                 pass
@@ -989,14 +566,40 @@ async def run_pipeline_session(is_first: bool = False):
             except asyncio.TimeoutError:
                 pass
 
-            if app.claude.is_busy:
-                app.last_activity = time.time()
-                continue
-
             if time.time() - app.last_activity > IDLE_TIMEOUT:
                 logger.info("Idle timeout — disconnecting")
                 await task.queue_frames([EndFrame()])
                 return
+
+    async def notification_monitor():
+        """Check for Claude Code task completions and inject into Gemini."""
+        while not session_stop.is_set():
+            try:
+                await asyncio.wait_for(session_stop.wait(), timeout=5)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            notifications = check_notifications()
+            for project, summary in notifications:
+                logger.info(f"Delivering notification: {project}")
+                try:
+                    if llm._session and not llm._disconnecting:
+                        from google.genai.types import Content, Part
+                        msg = Content(
+                            role="user",
+                            parts=[Part(text=(
+                                f"IMPORTANT: Claude just finished a coding task on '{project}'. "
+                                f"Tell the user immediately: '{summary[:200]}'. "
+                                "Be brief but make sure they know."
+                            ))],
+                        )
+                        await llm._session.send_client_content(
+                            turns=[msg], turn_complete=True,
+                        )
+                        app.last_activity = time.time()
+                except Exception as e:
+                    logger.error(f"Notification delivery failed: {e}")
 
     async def run_pipeline():
         runner = PipelineRunner(handle_sigint=False)
@@ -1004,7 +607,10 @@ async def run_pipeline_session(is_first: bool = False):
         session_stop.set()
 
     try:
-        await asyncio.gather(run_pipeline(), start_conversation(), keepalive(), idle_monitor())
+        await asyncio.gather(
+            run_pipeline(), start_conversation(), keepalive(),
+            idle_monitor(), notification_monitor(),
+        )
     except asyncio.CancelledError:
         pass
     except Exception as e:
@@ -1016,40 +622,75 @@ async def run_pipeline_session(is_first: bool = False):
 
 
 # =============================================================================
-# Main loop + signal handling
+# Main loop — Gemini ↔ Claude mode switching
 # =============================================================================
 
 async def main():
     print("\n  Jarvis starting. Say 'hey jarvis' to wake. Ctrl+C to stop.\n")
 
+    # Pre-initialize acknowledgment cache for Claude mode
+    try:
+        await asyncio.to_thread(init_ack_cache)
+        start_hotkey_listener()
+    except Exception as e:
+        logger.warning(f"Ack cache init failed (non-fatal): {e}")
+
     is_first = True
     while True:
         app.sleep_requested = False
+        app.enter_claude_mode = False
+
+        # ── Run Gemini pipeline ──
         logger.info("Gemini session starting...")
         await run_pipeline_session(is_first=is_first)
-        logger.info("Session ended, entering idle")
-
+        logger.info("Gemini session ended")
         is_first = False
 
-        if app.pending_claude_result:
-            logger.info("Claude result pending — reconnecting immediately")
+        # ── Check for Claude mode handoff ──
+        if app.enter_claude_mode:
+            logger.info(f"Entering Claude mode: {app.claude_mode_project}")
+            result = await run_claude_mode(
+                app.claude_mode_project,
+                app.claude_mode_session,
+                app.claude_mode_path,
+            )
+            logger.info(f"Claude mode returned: {result}")
+
+            app.returned_from_claude = True
+            app.returned_project = app.claude_mode_project
+
+            # Reset handoff state
+            app.enter_claude_mode = False
+            app.claude_mode_project = None
+            app.claude_mode_session = None
+            app.claude_mode_path = None
+
+            # Go straight back to Gemini (no wake word needed)
             continue
 
-        print("  Idle — listening for 'alexa'...")
+        # ── Idle — wait for wake word ──
+        if not app.sleep_requested:
+            # Pipeline ended for other reasons (timeout, error)
+            pass
+
+        print("  Idle — listening for 'hey jarvis'...")
         loop = asyncio.get_event_loop()
         while True:
             detected = await loop.run_in_executor(None, wait_for_wakeword, 5.0)
             if detected:
-                logger.info("Wake word — reconnecting")
+                logger.info("Wake word detected")
                 break
-            if app.pending_claude_result:
-                logger.info("Claude result pending — reconnecting")
+            # Also check for task completion notifications
+            notifications = check_notifications()
+            if notifications:
+                logger.info("Task completed while idle — reconnecting to notify")
                 break
 
 
 def _force_exit(signum, frame):
-    if app.claude.proc and app.claude.proc.poll() is None:
-        app.claude.proc.kill()
+    # Kill any active Claude Code sessions
+    for project in list(get_all_session_statuses().keys()):
+        kill_session(project)
     print("\n  Jarvis stopped.\n")
     os._exit(0)
 
