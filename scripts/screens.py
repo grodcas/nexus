@@ -297,6 +297,206 @@ def focus_app(app_name: str) -> None:
 
 
 # =============================================================================
+# List all windows
+# =============================================================================
+
+def list_windows() -> list[Window]:
+    """
+    Return all visible windows across all applications.
+    Skips background-only processes and windows with empty titles.
+    """
+    script = '''
+tell application "System Events"
+    set output to ""
+    repeat with proc in (every process whose visible is true)
+        set procName to name of proc
+        try
+            repeat with w in windows of proc
+                set wName to name of w
+                if wName is not "" then
+                    set {wx, wy} to position of w
+                    set {ww, wh} to size of w
+                    set output to output & procName & "|||" & wName & "|||" & wx & "|||" & wy & "|||" & ww & "|||" & wh & linefeed
+                end if
+            end repeat
+        end try
+    end repeat
+    return output
+end tell
+'''
+    try:
+        raw = _osa(script)
+    except RuntimeError:
+        return []
+
+    windows: list[Window] = []
+    for line in raw.strip().splitlines():
+        parts = line.split("|||")
+        if len(parts) >= 6:
+            try:
+                windows.append(Window(
+                    process=parts[0].strip(),
+                    title=parts[1].strip(),
+                    x=int(parts[2].strip()),
+                    y=int(parts[3].strip()),
+                    width=int(parts[4].strip()),
+                    height=int(parts[5].strip()),
+                ))
+            except ValueError:
+                continue
+    return windows
+
+
+# =============================================================================
+# Close / minimize / maximize
+# =============================================================================
+
+def close_window(process_substr: str, window_title: str | None = None) -> bool:
+    """
+    Close a window. If window_title is given, close the window matching
+    that title; otherwise close window 1 of the matching process.
+    Returns True on success.
+    """
+    if window_title:
+        script = (
+            f'tell application "System Events" to tell '
+            f'(first process whose name contains "{process_substr}") to '
+            f'click button 1 of (first window whose name contains "{window_title}")'
+        )
+    else:
+        script = (
+            f'tell application "System Events" to tell '
+            f'(first process whose name contains "{process_substr}") to '
+            f'click button 1 of window 1'
+        )
+    try:
+        _osa(script)
+        return True
+    except RuntimeError:
+        return False
+
+
+def minimize_window(process_substr: str) -> bool:
+    """Minimize window 1 of the matching process."""
+    script = (
+        f'tell application "System Events" to tell '
+        f'(first process whose name contains "{process_substr}") to '
+        f'set value of attribute "AXMinimized" of window 1 to true'
+    )
+    try:
+        _osa(script)
+        return True
+    except RuntimeError:
+        return False
+
+
+def maximize_window(process_substr: str) -> None:
+    """
+    Expand window to fill the display it's currently on.
+    Determines which display the window is on, then resizes to fill it.
+    """
+    win = find_window(process_substr)
+    if not win:
+        raise RuntimeError(f"No window found for '{process_substr}'")
+
+    displays = list_displays()
+    if not displays:
+        raise RuntimeError("No displays found")
+
+    # Determine which display the window center is on
+    bounds = virtual_desktop_bounds()
+    win_center_x = win.x + win.width // 2
+
+    # Simple heuristic: main display starts at x=0
+    main = [d for d in displays if d.is_main]
+    secondary = [d for d in displays if not d.is_main]
+
+    if secondary and main:
+        main_w = main[0].width
+        if win_center_x >= main_w:
+            # Window is on secondary display
+            d = secondary[0]
+            place_window(process_substr, main_w, 0, d.width, d.height)
+        else:
+            d = main[0]
+            place_window(process_substr, 0, 25, d.width, d.height - 25)
+    elif main:
+        d = main[0]
+        place_window(process_substr, 0, 25, d.width, d.height - 25)
+
+
+# =============================================================================
+# Preset positions — snap to halves / quarters of a display
+# =============================================================================
+
+def snap_window(process_substr: str, position: str, screen: str = "current") -> None:
+    """
+    Snap a window to a preset position on a display.
+
+    position: "left", "right", "top-left", "top-right",
+              "bottom-left", "bottom-right", "center", "full"
+    screen: "current", "main", "secondary", or "other"
+            "other" moves the window to whichever display it's NOT on.
+    """
+    displays = list_displays()
+    if not displays:
+        raise RuntimeError("No displays found")
+
+    main = [d for d in displays if d.is_main]
+    secondary = [d for d in displays if not d.is_main]
+    main_d = main[0] if main else displays[0]
+    sec_d = secondary[0] if secondary else None
+
+    # Resolve target display
+    if screen == "other":
+        win = find_window(process_substr)
+        if win and sec_d:
+            win_center_x = win.x + win.width // 2
+            target_d = sec_d if win_center_x < main_d.width else main_d
+            x_offset = main_d.width if target_d is sec_d else 0
+        else:
+            target_d = main_d
+            x_offset = 0
+    elif screen == "secondary" and sec_d:
+        target_d = sec_d
+        x_offset = main_d.width
+    else:
+        # "main" or "current" — use main
+        if screen == "current":
+            win = find_window(process_substr)
+            if win and sec_d and win.x >= main_d.width:
+                target_d = sec_d
+                x_offset = main_d.width
+            else:
+                target_d = main_d
+                x_offset = 0
+        else:
+            target_d = main_d
+            x_offset = 0
+
+    dw = target_d.width
+    dh = target_d.height
+    menu_bar = 25  # macOS menu bar height
+
+    positions = {
+        "left":         (x_offset, menu_bar, dw // 2, dh - menu_bar),
+        "right":        (x_offset + dw // 2, menu_bar, dw // 2, dh - menu_bar),
+        "top-left":     (x_offset, menu_bar, dw // 2, (dh - menu_bar) // 2),
+        "top-right":    (x_offset + dw // 2, menu_bar, dw // 2, (dh - menu_bar) // 2),
+        "bottom-left":  (x_offset, menu_bar + (dh - menu_bar) // 2, dw // 2, (dh - menu_bar) // 2),
+        "bottom-right": (x_offset + dw // 2, menu_bar + (dh - menu_bar) // 2, dw // 2, (dh - menu_bar) // 2),
+        "center":       (x_offset + dw // 4, menu_bar + (dh - menu_bar) // 4, dw // 2, (dh - menu_bar) // 2),
+        "full":         (x_offset, menu_bar, dw, dh - menu_bar),
+    }
+
+    if position not in positions:
+        raise ValueError(f"Unknown position '{position}'. Use: {', '.join(positions.keys())}")
+
+    x, y, w, h = positions[position]
+    place_window(process_substr, x, y, w, h)
+
+
+# =============================================================================
 # Demo / smoke test
 # =============================================================================
 
@@ -306,3 +506,7 @@ if __name__ == "__main__":
         print(f"  {d}")
     print()
     print(f"Virtual desktop bounds: {virtual_desktop_bounds()}")
+    print()
+    print("Visible windows:")
+    for w in list_windows():
+        print(f"  [{w.process}] {w.title} — pos=({w.x},{w.y}) size={w.width}x{w.height}")

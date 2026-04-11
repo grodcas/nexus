@@ -529,8 +529,103 @@ async def handle_navigate_browser(params: FunctionCallParams):
     await params.result_callback({"result": result})
 
 
+# ── 9. manage_windows ──
+
+_screens_module = None
+
+def _get_screens():
+    """Lazy-import screens module from scripts/."""
+    global _screens_module
+    if _screens_module is None:
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts_dir))
+        import screens
+        _screens_module = screens
+    return _screens_module
+
+
+def _execute_window_action(action: str, app_name: str, position: str, screen: str, width: int, height: int, x: int, y: int) -> str:
+    """Execute a window management action. Runs in thread."""
+    s = _get_screens()
+
+    if action == "list":
+        windows = s.list_windows()
+        if not windows:
+            return "No visible windows found."
+        lines = []
+        for w in windows:
+            lines.append(f"{w.process}: \"{w.title}\" at ({w.x},{w.y}) size {w.width}x{w.height}")
+        return "\n".join(lines[:20])  # Cap at 20
+
+    if not app_name:
+        return "Error: app_name is required for this action."
+
+    if action == "move":
+        if position:
+            s.snap_window(app_name, position, screen or "current")
+            return f"Moved {app_name} to {position}" + (f" on {screen} screen" if screen else "")
+        elif x is not None and y is not None:
+            s.move_window(app_name, x, y)
+            return f"Moved {app_name} to ({x}, {y})"
+        else:
+            return "Error: specify position (e.g. 'left', 'right') or x/y coordinates."
+
+    elif action == "resize":
+        if width and height:
+            s.resize_window(app_name, width, height)
+            return f"Resized {app_name} to {width}x{height}"
+        else:
+            return "Error: width and height required for resize."
+
+    elif action == "maximize":
+        s.maximize_window(app_name)
+        return f"Maximized {app_name}"
+
+    elif action == "minimize":
+        ok = s.minimize_window(app_name)
+        return f"Minimized {app_name}" if ok else f"Could not minimize {app_name}"
+
+    elif action == "close":
+        ok = s.close_window(app_name)
+        return f"Closed {app_name}" if ok else f"Could not close {app_name}"
+
+    elif action == "focus":
+        s.focus_app(app_name)
+        return f"Focused {app_name}"
+
+    elif action == "find":
+        win = s.find_window(app_name)
+        if win:
+            return f"{win.process}: \"{win.title}\" at ({win.x},{win.y}) size {win.width}x{win.height}"
+        return f"No window found for '{app_name}'"
+
+    else:
+        return f"Unknown action: {action}"
+
+
+async def handle_manage_windows(params: FunctionCallParams):
+    """Manage windows — list, move, resize, close, minimize, maximize, focus."""
+    action = params.arguments.get("action", "list")
+    app_name = params.arguments.get("app_name", "")
+    position = params.arguments.get("position", "")
+    screen = params.arguments.get("screen", "")
+    width = params.arguments.get("width", 0)
+    height = params.arguments.get("height", 0)
+    x = params.arguments.get("x")
+    y = params.arguments.get("y")
+
+    try:
+        result = await asyncio.to_thread(
+            _execute_window_action, action, app_name, position, screen, width, height, x, y
+        )
+    except Exception as e:
+        result = f"Error: {str(e)[:200]}"
+
+    await params.result_callback({"result": result})
+
+
 # =============================================================================
-# Tool schema — 8 tools
+# Tool schema — 9 tools
 # =============================================================================
 
 TOOLS = [
@@ -628,6 +723,39 @@ TOOLS = [
                     "required": ["destination", "goal"],
                 },
             },
+            {
+                "name": "manage_windows",
+                "description": "Manage application windows: list, move, resize, close, minimize, maximize, or focus. Use for any window management request.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "move", "resize", "maximize", "minimize", "close", "focus", "find"],
+                            "description": "What to do. 'list' shows all windows. 'move' positions a window. 'resize' changes size. 'maximize' fills the screen. 'close' closes the window.",
+                        },
+                        "app_name": {
+                            "type": "string",
+                            "description": "App name or substring to match (e.g. 'Chrome', 'iTerm', 'Finder', 'Slack'). Required for all actions except 'list'.",
+                        },
+                        "position": {
+                            "type": "string",
+                            "enum": ["left", "right", "top-left", "top-right", "bottom-left", "bottom-right", "center", "full"],
+                            "description": "Preset position for 'move' action. Snaps the window to that portion of the screen.",
+                        },
+                        "screen": {
+                            "type": "string",
+                            "enum": ["main", "secondary", "other"],
+                            "description": "Which screen to place the window on. 'other' moves it to the opposite screen from where it is now.",
+                        },
+                        "width": {"type": "integer", "description": "Width in pixels (for resize)."},
+                        "height": {"type": "integer", "description": "Height in pixels (for resize)."},
+                        "x": {"type": "integer", "description": "X position in pixels (for move, instead of preset position)."},
+                        "y": {"type": "integer", "description": "Y position in pixels (for move, instead of preset position)."},
+                    },
+                    "required": ["action"],
+                },
+            },
         ]
     }
 ]
@@ -657,6 +785,8 @@ Browser — the keyword "browser" means use navigate_browser:
 
 Document search — only when user says "search my documents" or "find in my files":
 - "search my documents for X" → search_documents
+
+Window requests (move, resize, close) → manage_windows
 
 Available projects: {projects}
 """
@@ -707,6 +837,8 @@ async def run_pipeline_session(is_first: bool = False):
                           cancel_on_interruption=False)
     llm.register_function("navigate_browser", track_activity(handle_navigate_browser),
                           cancel_on_interruption=False, timeout_secs=120)
+    llm.register_function("manage_windows", track_activity(handle_manage_windows),
+                          cancel_on_interruption=False, timeout_secs=15)
 
     # Build initial context
     if is_first:
