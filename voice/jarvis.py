@@ -72,6 +72,47 @@ IDLE_TIMEOUT = 420  # 7 minutes
 
 
 # =============================================================================
+# Context summarizer — keeps Gemini's context compact
+# =============================================================================
+
+_haiku_client = None
+
+
+def _get_haiku():
+    global _haiku_client
+    if _haiku_client is None:
+        from anthropic import Anthropic
+        _haiku_client = Anthropic()
+    return _haiku_client
+
+
+def _summarize_context(conversation_text: str) -> str:
+    """Summarize old conversation into a tight status line via Haiku."""
+    try:
+        response = _get_haiku().messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system=(
+                "Summarize this conversation into one short status line. "
+                "Format: keyword tags of what happened. "
+                "Only include what matters for continuity — active tasks, "
+                "open documents, current browsing, pending requests. "
+                "Drop greetings, completed actions, small talk. "
+                "Example: 'browsed Gmail spam | searched Google Images for drone lidar | document report.docx open' "
+                "Max 100 words. No filler."
+            ),
+            messages=[{
+                "role": "user",
+                "content": conversation_text[:3000],
+            }],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Context summarization failed: {e}")
+        return "previous conversation (summary unavailable)"
+
+
+# =============================================================================
 # App state — simpler now (coding state is in claude_mode)
 # =============================================================================
 
@@ -162,7 +203,7 @@ def track_activity(handler):
 
 
 # =============================================================================
-# Tool handlers — 7 tools
+# Tool handlers — 8 tools
 # =============================================================================
 
 # ── 1. connect_project ──
@@ -329,8 +370,167 @@ async def handle_sleep(params: FunctionCallParams):
         await app.pipeline_task.queue_frames([EndFrame()])
 
 
+# ── 8. navigate_browser ──
+
+NAV_RESULT_CAP = 3000  # Hard cap — Gemini crashes above this
+
+# Persistent browser process — started once, reused across navigate calls
+_browser_started = False
+
+
+def _ensure_nav_browser():
+    """Start the persistent browser if not running. Called in thread."""
+    global _browser_started
+    if _browser_started:
+        from browser import is_running
+        if is_running():
+            return
+    from browser import ensure_browser
+    ensure_browser()
+    _browser_started = True
+
+
+def _run_nav_claude(destination: str, goal: str) -> str:
+    """Run a Claude Code session for browser navigation. Returns concise result."""
+    nav_script = os.path.join(os.path.dirname(__file__), "nav.py")
+    venv_python = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "venv", "bin", "python3")
+    )
+
+    prompt = (
+        f"Navigate the browser to: {destination}\n"
+        f"Goal: {goal}\n\n"
+        f"Use this CLI to control the browser:\n"
+        f"  {venv_python} {nav_script} state        — see current page\n"
+        f"  {venv_python} {nav_script} goto <url>   — go to URL\n"
+        f"  {venv_python} {nav_script} click \"text\" — click link/button\n"
+        f"  {venv_python} {nav_script} type \"field\" \"value\" — type into input\n"
+        f"  {venv_python} {nav_script} press Enter  — press key\n"
+        f"  {venv_python} {nav_script} scroll down  — scroll page\n\n"
+        "RULES:\n"
+        "- Start with 'state' to see current page, then navigate step by step.\n"
+        "- Your ENTIRE final response must be under 150 chars.\n"
+        "- Examples of good responses:\n"
+        "    'Done. Gmail spam folder is open. 14 messages.'\n"
+        "    'Login required. Opened login page in browser.'\n"
+        "    'Error: page not found. Check the URL.'\n"
+        "- NEVER explain what you did step by step. Just the end state.\n"
+        "- If login is needed, say 'Login required' and stop.\n"
+        "- If something fails after 3 attempts, say what went wrong in one sentence.\n"
+    )
+
+    cmd = [
+        "claude", "--print", "--verbose",
+        "--output-format", "stream-json",
+        "--dangerously-skip-permissions",
+        "-p", prompt,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(__file__),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        result_text = ""
+        start_time = time.time()
+        nav_timeout = 90  # seconds
+
+        # Read stream-json events, extract final result
+        while proc.poll() is None:
+            if time.time() - start_time > nav_timeout:
+                proc.kill()
+                return "Navigation timed out."
+
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                event = json.loads(line.decode("utf-8", errors="replace"))
+                etype = event.get("type", "")
+
+                if etype == "assistant":
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            text = block.get("text", "").strip()
+                            if text:
+                                result_text = text
+
+                elif etype == "result":
+                    result = event.get("result", "").strip()
+                    if result:
+                        result_text = result
+            except json.JSONDecodeError:
+                pass
+
+        # Drain remaining output
+        remaining = proc.stdout.read()
+        if remaining:
+            for raw in remaining.split(b"\n"):
+                if raw.strip():
+                    try:
+                        event = json.loads(raw.decode("utf-8", errors="replace"))
+                        if event.get("type") == "result":
+                            result = event.get("result", "").strip()
+                            if result:
+                                result_text = result
+                    except json.JSONDecodeError:
+                        pass
+
+        # Log stderr for debugging
+        stderr = proc.stderr.read()
+        if stderr:
+            logger.warning(f"Navigate stderr: {stderr.decode()[:300]}")
+
+        proc.wait(timeout=5)
+
+        if not result_text:
+            return "Navigation completed but no status returned."
+
+        # HARD CAP — protect Gemini
+        if len(result_text) > NAV_RESULT_CAP:
+            result_text = result_text[:NAV_RESULT_CAP]
+
+        return result_text
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return "Navigation timed out."
+    except Exception as e:
+        return f"Navigation error: {str(e)[:200]}"
+
+
+async def handle_navigate_browser(params: FunctionCallParams):
+    """Navigate the browser to a destination. Runs Claude Code inline."""
+    destination = params.arguments.get("destination", "")
+    goal = params.arguments.get("goal", destination)
+
+    if not destination:
+        await params.result_callback({"result": "No destination specified."})
+        return
+
+    # Start browser in background thread (if not already running)
+    try:
+        await asyncio.to_thread(_ensure_nav_browser)
+    except Exception as e:
+        await params.result_callback({
+            "result": f"Could not start browser: {str(e)[:200]}"
+        })
+        return
+
+    # Run Claude Code navigation in thread (blocking, ~10-30s)
+    logger.info(f"Navigate: {destination} — {goal}")
+    result = await asyncio.to_thread(_run_nav_claude, destination, goal)
+    logger.info(f"Navigate result: {result[:200]}")
+
+    await params.result_callback({"result": result})
+
+
 # =============================================================================
-# Tool schema — 7 tools
+# Tool schema — 8 tools
 # =============================================================================
 
 TOOLS = [
@@ -385,7 +585,7 @@ TOOLS = [
             },
             {
                 "name": "search_documents",
-                "description": "Search document archive by keywords.",
+                "description": "Search the user's LOCAL document archive (OneDrive files) by keywords. NOT for web search — use navigate_browser for Google.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -410,6 +610,24 @@ TOOLS = [
                 "description": "Go to sleep. Say 'sleep' or 'goodbye'.",
                 "parameters": {"type": "object", "properties": {}},
             },
+            {
+                "name": "navigate_browser",
+                "description": "Open a website, navigate to a page, or search the web. Use for: 'search for X on Google', 'search Google Images for X', 'open Gmail spam', 'go to Shopify settings'. Handles Google Search, Google Images, Google News, Google Maps, and any website navigation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "destination": {
+                            "type": "string",
+                            "description": "The website or search engine (e.g. 'gmail', 'google', 'google images', 'google news', 'shopify', 'figma')",
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "What to do (e.g. 'search for drone lidar', 'spam folder', 'settings page')",
+                        },
+                    },
+                    "required": ["destination", "goal"],
+                },
+            },
         ]
     }
 ]
@@ -427,6 +645,18 @@ Rules:
 - When a tool returns data, summarize the key points in 2-4 spoken sentences. Do not read raw data.
 - Keep ALL responses under 25 seconds of speech. Be brief. If there is too much data, give the highlights and ask if the user wants more detail.
 - For briefings: top 3 items only, one sentence each.
+
+Browser — the keyword "browser" means use navigate_browser:
+- "browser, search for X" → navigate_browser (destination=google, goal=EXACT search query as user said it)
+- "browser, search images of X" → navigate_browser (destination=google images, goal=EXACT search query)
+- "browser, go to Gmail" → navigate_browser (destination=gmail, goal=open)
+- "browser, open Shopify settings" → navigate_browser (destination=shopify, goal=settings)
+- Any request starting with "browser" → navigate_browser. Always.
+- Pass the user's search query as they said it. Do not rephrase or substitute search terms.
+- When the result says "Login required", tell the user to enter credentials in the browser and say "done" when ready, then call navigate_browser again.
+
+Document search — only when user says "search my documents" or "find in my files":
+- "search my documents for X" → search_documents
 
 Available projects: {projects}
 """
@@ -462,7 +692,7 @@ async def run_pipeline_session(is_first: bool = False):
         ),
     )
 
-    # Register 7 tools
+    # Register 8 tools
     llm.register_function("connect_project", track_activity(handle_connect_project),
                           cancel_on_interruption=False, timeout_secs=15)
     llm.register_function("list_sessions", track_activity(handle_list_sessions))
@@ -475,6 +705,8 @@ async def run_pipeline_session(is_first: bool = False):
                           cancel_on_interruption=False, timeout_secs=30)
     llm.register_function("sleep", track_activity(handle_sleep),
                           cancel_on_interruption=False)
+    llm.register_function("navigate_browser", track_activity(handle_navigate_browser),
+                          cancel_on_interruption=False, timeout_secs=120)
 
     # Build initial context
     if is_first:
@@ -494,6 +726,8 @@ async def run_pipeline_session(is_first: bool = False):
         initial_msg = "The user just said 'hey jarvis'. Acknowledge briefly — you're ready."
 
     context = LLMContext([{"role": "user", "content": initial_msg}])
+    app.context = context  # Store for trimming
+
     user_params = LLMUserAggregatorParams(
         user_mute_strategies=[AlwaysUserMuteStrategy()],
         vad_analyzer=SileroVADAnalyzer(),
@@ -558,6 +792,91 @@ async def run_pipeline_session(is_first: bool = False):
             except Exception:
                 pass
 
+    async def context_trimmer():
+        """Keep context at a fixed char budget — never let it bloat.
+
+        Every 15s, measure total context size in chars. If over MAX_CONTEXT_CHARS,
+        summarize the oldest messages until we're under budget. The context
+        sent to Gemini stays roughly the same size always.
+        """
+        MAX_CONTEXT_CHARS = 2000
+
+        def _measure(msgs):
+            total = 0
+            for msg in msgs:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                total += len(str(content))
+            return total
+
+        while not session_stop.is_set():
+            try:
+                await asyncio.wait_for(session_stop.wait(), timeout=15)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                messages = context.get_messages()
+                total_chars = _measure(messages)
+
+                if total_chars <= MAX_CONTEXT_CHARS:
+                    continue
+
+                # Walk from the end to find how many recent messages fit in half the budget
+                keep_budget = MAX_CONTEXT_CHARS // 2
+                keep_chars = 0
+                keep_from = len(messages)
+                for i in range(len(messages) - 1, -1, -1):
+                    content = messages[i].get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    msg_len = len(str(content))
+                    if keep_chars + msg_len > keep_budget and keep_from < len(messages):
+                        break
+                    keep_chars += msg_len
+                    keep_from = i
+
+                old_messages = messages[:keep_from]
+                recent_messages = messages[keep_from:]
+
+                # Summarize old messages
+                old_text = []
+                for msg in old_messages:
+                    role = msg.get("role", "?")
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        content = " ".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    if content:
+                        old_text.append(f"{role}: {str(content)[:200]}")
+
+                if not old_text:
+                    continue
+
+                summary = await asyncio.to_thread(
+                    _summarize_context, "\n".join(old_text)
+                )
+
+                new_messages = [
+                    {"role": "user", "content": f"[Context: {summary}]"},
+                ] + recent_messages
+                context.set_messages(new_messages)
+                logger.info(
+                    f"Context trimmed: {total_chars} → {_measure(new_messages)} chars"
+                )
+            except Exception as e:
+                logger.error(f"Context trim error: {e}")
+
     async def idle_monitor():
         while not session_stop.is_set():
             try:
@@ -609,7 +928,7 @@ async def run_pipeline_session(is_first: bool = False):
     try:
         await asyncio.gather(
             run_pipeline(), start_conversation(), keepalive(),
-            idle_monitor(), notification_monitor(),
+            idle_monitor(), notification_monitor(), context_trimmer(),
         )
     except asyncio.CancelledError:
         pass
@@ -694,6 +1013,12 @@ def _force_exit(signum, frame):
     # Kill any active Claude Code sessions
     for project in list(get_all_session_statuses().keys()):
         kill_session(project)
+    # Stop persistent browser if running
+    try:
+        from browser import stop_browser
+        stop_browser()
+    except Exception:
+        pass
     print("\n  Jarvis stopped.\n")
     os._exit(0)
 
