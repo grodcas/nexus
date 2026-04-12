@@ -74,7 +74,8 @@ TOOL_DECLARATIONS = [
                         "Details in user's words. For code: project name "
                         f"(one of: {', '.join(PROJECTS.keys())}). "
                         "For window: a verb-led command like 'move chrome left', "
-                        "'maximize iterm', 'close finder', 'list'."
+                        "'move chrome to other screen', 'move chrome left on secondary screen', "
+                        "'maximize iterm on main', 'close finder', 'list'."
                     ),
                 ),
                 "session": types.Schema(
@@ -206,6 +207,13 @@ _WINDOW_POSITIONS = {
     "bottom-left", "bottom-right", "center", "full",
 }
 
+_WINDOW_SCREENS = {
+    "other": "other",
+    "main": "main",
+    "primary": "main",
+    "secondary": "secondary",
+}
+
 
 def _handle_window(query: str) -> str:
     """Parse a freeform window command and dispatch to scripts/screens.py."""
@@ -216,12 +224,28 @@ def _handle_window(query: str) -> str:
             return "No windows."
         return "\n".join(f"{w.process}: {w.title[:40]}" for w in wins[:15])
 
+    # Strip stop-words that voice STT often inserts.
+    for noise in (" to the ", " to a ", " to ", " on the ", " on ", " the "):
+        q = q.replace(noise, " ")
     parts = q.replace("-", " ").split()
     verb = parts[0] if parts else ""
     rest = parts[1:]
-
-    position = None
     rest_joined = " ".join(rest)
+
+    # Extract screen target ("other screen", "main display", etc.).
+    screen = None
+    for word, value in _WINDOW_SCREENS.items():
+        if word in rest_joined.split():
+            screen = value
+            rest_joined = " ".join(w for w in rest_joined.split() if w != word)
+            break
+    # Drop the literal "screen"/"display"/"monitor" trailing tokens.
+    rest_joined = " ".join(
+        w for w in rest_joined.split() if w not in ("screen", "display", "monitor")
+    )
+
+    # Extract position.
+    position = None
     for p in _WINDOW_POSITIONS:
         if p.replace("-", " ") in rest_joined:
             position = p
@@ -233,15 +257,27 @@ def _handle_window(query: str) -> str:
         return "Specify an app name."
 
     try:
-        if verb in ("move", "snap", "place"):
+        if verb in ("move", "snap", "place", "send"):
+            # Cross-screen move with no explicit position → default to full.
+            if screen and not position:
+                position = "full"
             if position:
-                screens.snap_window(app, position)
+                screens.snap_window(app, position, screen or "current")
             screens.raise_window(app)
-            return f"Moved {app}" + (f" to {position}" if position else "")
+            where = []
+            if position:
+                where.append(position)
+            if screen:
+                where.append(f"on {screen} screen")
+            suffix = (" to " + " ".join(where)) if where else ""
+            return f"Moved {app}{suffix}"
         if verb in ("maximize", "fullscreen", "full"):
-            screens.maximize_window(app)
+            if screen:
+                screens.snap_window(app, "full", screen)
+            else:
+                screens.maximize_window(app)
             screens.raise_window(app)
-            return f"Maximized {app}"
+            return f"Maximized {app}" + (f" on {screen} screen" if screen else "")
         if verb == "minimize":
             screens.minimize_window(app)
             return f"Minimized {app}"
