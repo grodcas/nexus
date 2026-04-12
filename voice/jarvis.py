@@ -563,9 +563,11 @@ def _execute_window_action(action: str, app_name: str, position: str, screen: st
     if action == "move":
         if position:
             s.snap_window(app_name, position, screen or "current")
+            s.raise_window(app_name)
             return f"Moved {app_name} to {position}" + (f" on {screen} screen" if screen else "")
         elif x is not None and y is not None:
             s.move_window(app_name, x, y)
+            s.raise_window(app_name)
             return f"Moved {app_name} to ({x}, {y})"
         else:
             return "Error: specify position (e.g. 'left', 'right') or x/y coordinates."
@@ -573,12 +575,14 @@ def _execute_window_action(action: str, app_name: str, position: str, screen: st
     elif action == "resize":
         if width and height:
             s.resize_window(app_name, width, height)
+            s.raise_window(app_name)
             return f"Resized {app_name} to {width}x{height}"
         else:
             return "Error: width and height required for resize."
 
     elif action == "maximize":
         s.maximize_window(app_name)
+        s.raise_window(app_name)
         return f"Maximized {app_name}"
 
     elif action == "minimize":

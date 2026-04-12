@@ -284,6 +284,22 @@ def get_frontmost_app() -> str | None:
         return None
 
 
+def raise_window(process_substr: str) -> None:
+    """
+    Bring window 1 of the matching process to the front WITHOUT activating
+    its application — preserves the user's current keyboard focus.
+    Uses the AXRaise accessibility action.
+    """
+    try:
+        _osa(
+            f'tell application "System Events" to tell '
+            f'(first process whose name contains "{process_substr}") to '
+            f'perform action "AXRaise" of window 1'
+        )
+    except RuntimeError:
+        pass
+
+
 def focus_app(app_name: str) -> None:
     """
     Bring the named application to the front. Used to refocus the user's
