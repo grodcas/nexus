@@ -202,10 +202,10 @@ def _run_nav_claude(destination, goal):
         return f"Error: {str(e)[:100]}"
 
 
-_WINDOW_POSITIONS = {
-    "left", "right", "top-left", "top-right",
-    "bottom-left", "bottom-right", "center", "full",
-}
+_WINDOW_POSITIONS = [
+    "top-left", "top-right", "bottom-left", "bottom-right",
+    "left", "right", "center", "full",
+]
 
 _WINDOW_SCREENS = {
     "other": "other",
@@ -213,6 +213,29 @@ _WINDOW_SCREENS = {
     "primary": "main",
     "secondary": "secondary",
 }
+
+_BROWSER_PROCESS_HINTS = (
+    "chrome", "safari", "arc", "brave", "firefox", "edge", "vivaldi", "opera"
+)
+
+
+def _resolve_app_alias(app: str) -> str:
+    """
+    Resolve voice-friendly aliases like 'browser' or 'current browser'
+    to the actual running process name.
+    """
+    a = app.strip().lower()
+    if a in ("browser", "current browser", "the browser", "web browser"):
+        try:
+            front = screens.get_frontmost_app()
+            if front and any(h in front.lower() for h in _BROWSER_PROCESS_HINTS):
+                return front
+            for w in screens.list_windows():
+                if any(h in w.process.lower() for h in _BROWSER_PROCESS_HINTS):
+                    return w.process
+        except Exception:
+            pass
+    return app
 
 
 def _handle_window(query: str) -> str:
@@ -255,6 +278,7 @@ def _handle_window(query: str) -> str:
     app = rest_joined.strip()
     if not app and verb != "list":
         return "Specify an app name."
+    app = _resolve_app_alias(app)
 
     try:
         if verb in ("move", "snap", "place", "send"):
