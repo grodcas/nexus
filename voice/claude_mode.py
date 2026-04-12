@@ -329,7 +329,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
         claude._notify_on_complete = claude.is_busy
         if claude.is_busy:
             logger.info(f"Claude still working on {project} — notifications enabled")
-        return _exit_to_jarvis()
+        return "jarvis"
 
     claudia = Claudia()
     last_claude_output: str | None = None
