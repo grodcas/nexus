@@ -24,8 +24,11 @@ import pyaudio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts")))
-from session_manager import load_projects
+from session_manager import load_projects, format_sessions_for_display
+from claude_mode import run_claude_mode
 import screens
+
+_handoff: dict = {"project": None, "session": None, "path": None}
 
 logger.remove(0)
 logger.add(sys.stderr, level="INFO")
@@ -73,6 +76,10 @@ TOOL_DECLARATIONS = [
                         "For window: a verb-led command like 'move chrome left', "
                         "'maximize iterm', 'close finder', 'list'."
                     ),
+                ),
+                "session": types.Schema(
+                    type=types.Type.STRING,
+                    description="For code only: 'last', 'previous', or 'new'. Omit on the first call to list available sessions.",
                 ),
             },
             required=["action"],
@@ -249,7 +256,7 @@ def _handle_window(query: str) -> str:
         return f"Window error: {str(e)[:80]}"
 
 
-def handle_tool(action: str, query: str = "") -> tuple[str, bool]:
+def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, bool]:
     """
     Execute tool. Returns (result_text, is_long).
     If is_long=True, result should be spoken by TTS directly (bypass Gemini).
@@ -295,10 +302,23 @@ def handle_tool(action: str, query: str = "") -> tuple[str, bool]:
         return result, False
 
     elif action in ("code", "connect"):
-        project = query.lower().strip() if query else ""
-        if project in PROJECTS:
-            return f"CONNECT:{project}", False
-        return f"Unknown project. Available: {', '.join(PROJECTS.keys())}", False
+        project = (query or "").lower().strip()
+        if project not in PROJECTS:
+            return f"Unknown project. Available: {', '.join(PROJECTS.keys())}", False
+
+        path = os.path.expanduser(PROJECTS[project])
+        if not os.path.isdir(path):
+            return f"Path '{path}' not found.", False
+
+        choice = (session or "").lower().strip()
+        if choice not in ("last", "previous", "new"):
+            return format_sessions_for_display(project), False
+
+        # Stage handoff — main loop will close Gemini and run Claude mode.
+        _handoff["project"] = project
+        _handoff["session"] = choice
+        _handoff["path"] = path
+        return f"Switching to Claude coding mode for {project}. Goodbye for now.", False
 
     elif action == "github":
         try:
@@ -346,72 +366,109 @@ async def main():
     )
 
     pa = pyaudio.PyAudio()
-    mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                  input=True, frames_per_buffer=CHUNK)
-    spk = pa.open(format=pyaudio.paInt16, channels=1, rate=RECV_RATE,
-                  output=True, frames_per_buffer=4096)
-
     print("  Jarvis Slim running. Just talk. Ctrl+C to quit.\n")
 
-    async with client.aio.live.connect(
-        model="gemini-2.5-flash-native-audio-preview-12-2025",
-        config=config,
-    ) as session:
+    try:
+        while True:
+            _handoff["project"] = None
+            _handoff["session"] = None
+            _handoff["path"] = None
 
-        async def send_audio():
-            loop = asyncio.get_event_loop()
-            while True:
-                data = await loop.run_in_executor(None, mic.read, CHUNK, False)
-                await session.send_realtime_input(
-                    audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
-                )
+            mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
+                          input=True, frames_per_buffer=CHUNK)
+            spk = pa.open(format=pyaudio.paInt16, channels=1, rate=RECV_RATE,
+                          output=True, frames_per_buffer=4096)
 
-        async def receive():
-            while True:
-                async for msg in session.receive():
-                    # Play audio
-                    if msg.data:
-                        spk.write(msg.data)
+            try:
+                async with client.aio.live.connect(
+                    model="gemini-2.5-flash-native-audio-preview-12-2025",
+                    config=config,
+                ) as session:
 
-                    # Handle tool calls
-                    if msg.tool_call:
-                        for fc in msg.tool_call.function_calls:
-                            logger.info(f"Tool call: {fc.name}({dict(fc.args)})")
-                            args = dict(fc.args) if fc.args else {}
-                            action = args.get("action", "")
-                            query = args.get("query", "")
-
-                            result, is_long = await asyncio.to_thread(
-                                handle_tool, action, query
+                    async def send_audio():
+                        loop = asyncio.get_event_loop()
+                        while True:
+                            data = await loop.run_in_executor(None, mic.read, CHUNK, False)
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                             )
 
-                            if is_long:
-                                # Speak directly via TTS, tell Gemini it's done
-                                await asyncio.to_thread(tts_speak_long, result)
-                                gemini_result = "Done. Already spoken to user."
-                            else:
-                                gemini_result = result
+                    async def receive():
+                        while True:
+                            async for msg in session.receive():
+                                if msg.data:
+                                    spk.write(msg.data)
 
-                            logger.info(f"Result ({len(gemini_result)} chars): {gemini_result[:100]}")
+                                if msg.tool_call:
+                                    for fc in msg.tool_call.function_calls:
+                                        logger.info(f"Tool call: {fc.name}({dict(fc.args)})")
+                                        args = dict(fc.args) if fc.args else {}
+                                        action = args.get("action", "")
+                                        query = args.get("query", "")
+                                        sess_choice = args.get("session", "")
 
-                            # Send result back to Gemini
-                            await session.send_tool_response(
-                                function_responses=[types.FunctionResponse(
-                                    name=fc.name,
-                                    id=fc.id,
-                                    response={"result": gemini_result},
-                                )]
-                            )
+                                        result, is_long = await asyncio.to_thread(
+                                            handle_tool, action, query, sess_choice
+                                        )
 
-        try:
-            await asyncio.gather(send_audio(), receive())
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            pass
+                                        if is_long:
+                                            await asyncio.to_thread(tts_speak_long, result)
+                                            gemini_result = "Done. Already spoken to user."
+                                        else:
+                                            gemini_result = result
 
-    mic.close()
-    spk.close()
-    pa.terminate()
-    print("\n  Jarvis stopped.\n")
+                                        logger.info(f"Result ({len(gemini_result)} chars): {gemini_result[:100]}")
+
+                                        await session.send_tool_response(
+                                            function_responses=[types.FunctionResponse(
+                                                name=fc.name,
+                                                id=fc.id,
+                                                response={"result": gemini_result},
+                                            )]
+                                        )
+
+                                        if _handoff["project"]:
+                                            # Let the goodbye line play, then exit Gemini.
+                                            await asyncio.sleep(2.5)
+                                            return
+
+                    send_task = asyncio.create_task(send_audio())
+                    recv_task = asyncio.create_task(receive())
+                    try:
+                        done, pending = await asyncio.wait(
+                            [send_task, recv_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                        for t in pending:
+                            try:
+                                await t
+                            except (asyncio.CancelledError, Exception):
+                                pass
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        send_task.cancel()
+                        recv_task.cancel()
+            finally:
+                mic.close()
+                spk.close()
+
+            if _handoff["project"]:
+                proj = _handoff["project"]
+                sess = _handoff["session"]
+                path = _handoff["path"]
+                logger.info(f"Entering Claude mode: {proj} ({sess})")
+                try:
+                    await run_claude_mode(proj, sess, path)
+                except Exception as e:
+                    logger.error(f"Claude mode error: {e}")
+                logger.info("Claude mode returned — back to Gemini")
+                continue
+
+            break
+    finally:
+        pa.terminate()
+        print("\n  Jarvis stopped.\n")
 
 
 if __name__ == "__main__":
