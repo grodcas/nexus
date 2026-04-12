@@ -214,28 +214,36 @@ _WINDOW_SCREENS = {
     "secondary": "secondary",
 }
 
-_BROWSER_PROCESS_HINTS = (
-    "chrome", "safari", "arc", "brave", "firefox", "edge", "vivaldi", "opera"
-)
+def _open_window_processes() -> list[str]:
+    """Distinct process names from currently visible windows."""
+    try:
+        return sorted({w.process for w in screens.list_windows()})
+    except Exception:
+        return []
 
 
-def _resolve_app_alias(app: str) -> str:
+def _match_open_window(app: str) -> str | None:
     """
-    Resolve voice-friendly aliases like 'browser' or 'current browser'
-    to the actual running process name.
+    Try to map a user-given app string to an actually-open window process.
+    Returns the real process name on success, None if nothing plausible.
     """
     a = app.strip().lower()
-    if a in ("browser", "current browser", "the browser", "web browser"):
-        try:
-            front = screens.get_frontmost_app()
-            if front and any(h in front.lower() for h in _BROWSER_PROCESS_HINTS):
-                return front
-            for w in screens.list_windows():
-                if any(h in w.process.lower() for h in _BROWSER_PROCESS_HINTS):
-                    return w.process
-        except Exception:
-            pass
-    return app
+    if not a:
+        return None
+    procs = _open_window_processes()
+    if not procs:
+        return None
+    # Substring either way (handles 'chrome' → 'Google Chrome', 'iterm' → 'iTerm2').
+    for p in procs:
+        pl = p.lower()
+        if a in pl or pl in a:
+            return p
+    # Token overlap (handles multi-word app names).
+    user_words = set(a.split())
+    for p in procs:
+        if user_words & set(p.lower().split()):
+            return p
+    return None
 
 
 def _handle_window(query: str) -> str:
@@ -278,7 +286,16 @@ def _handle_window(query: str) -> str:
     app = rest_joined.strip()
     if not app and verb != "list":
         return "Specify an app name."
-    app = _resolve_app_alias(app)
+
+    matched = _match_open_window(app)
+    if matched:
+        app = matched
+    elif verb not in ("list",):
+        # Hand Gemini the live list so it can retry with a real name.
+        procs = _open_window_processes()
+        if procs:
+            return f"No window matches '{app}'. Open windows: {', '.join(procs)}."
+        return f"No open windows."
 
     try:
         if verb in ("move", "snap", "place", "send"):
