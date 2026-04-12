@@ -170,10 +170,8 @@ def _run_nav_claude(destination, goal):
         f"Navigate the browser to: {destination}\nGoal: {goal}\n\n"
         f"Use: {venv_python} {nav_script} <cmd>\n"
         f"Commands: state, goto <url>, click \"text\", type \"field\" \"value\", press Enter, scroll down\n"
-        "Start with state. Prefer direct URLs over clicking — most webapps "
-        "have URL anchors for their sections (e.g. Gmail spam = "
-        "https://mail.google.com/mail/u/0/#spam, trash = #trash, starred = #starred; "
-        "GitHub notifications = github.com/notifications; etc). "
+        "Start with state. Prefer direct URLs over clicking when the site "
+        "exposes a stable URL for the section you need. "
         "Final response under 150 chars. If login needed say 'Login required'."
     )
 
