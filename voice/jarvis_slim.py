@@ -23,7 +23,9 @@ from loguru import logger
 import pyaudio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts")))
 from session_manager import load_projects
+import screens
 
 logger.remove(0)
 logger.add(sys.stderr, level="INFO")
@@ -46,7 +48,7 @@ SHORT_RESULT_LIMIT = 300
 # System prompt — under 300 chars
 # =============================================================================
 
-SYSTEM_PROMPT = "Be brief. Use the do tool for any actionable request."
+SYSTEM_PROMPT = "Be brief. Answer from your own knowledge first. Use the do tool only when the request needs an action."
 
 # =============================================================================
 # Tool declarations — minimal
@@ -55,17 +57,22 @@ SYSTEM_PROMPT = "Be brief. Use the do tool for any actionable request."
 TOOL_DECLARATIONS = [
     types.FunctionDeclaration(
         name="do",
-        description="Execute any user request: browse web, search, open sites, check calendar/email/reminders, search documents, connect to coding project, sleep.",
+        description="Execute an actionable request.",
         parameters=types.Schema(
             type=types.Type.OBJECT,
             properties={
                 "action": types.Schema(
                     type=types.Type.STRING,
-                    description="What to do: browse, search, calendar, email, reminders, documents, code, github, sleep",
+                    description="One of: browse, search, calendar, email, reminders, briefing, documents, code, github, window, sleep.",
                 ),
                 "query": types.Schema(
                     type=types.Type.STRING,
-                    description="Details: URL, search terms, project name, etc.",
+                    description=(
+                        "Details in user's words. For code: project name "
+                        f"(one of: {', '.join(PROJECTS.keys())}). "
+                        "For window: a verb-led command like 'move chrome left', "
+                        "'maximize iterm', 'close finder', 'list'."
+                    ),
                 ),
             },
             required=["action"],
@@ -96,7 +103,7 @@ def print_budget():
     print(f"  System prompt: \"{SYSTEM_PROMPT}\"")
     print()
     print(f"  Tool: do(action, query)")
-    print(f"    actions: browse, search, calendar, email, reminders, documents, code, github, sleep")
+    print(f"    actions: browse, search, calendar, email, reminders, briefing, documents, code, github, window, sleep")
     print()
 
 
@@ -187,6 +194,61 @@ def _run_nav_claude(destination, goal):
         return f"Error: {str(e)[:100]}"
 
 
+_WINDOW_POSITIONS = {
+    "left", "right", "top-left", "top-right",
+    "bottom-left", "bottom-right", "center", "full",
+}
+
+
+def _handle_window(query: str) -> str:
+    """Parse a freeform window command and dispatch to scripts/screens.py."""
+    q = (query or "").lower().strip()
+    if not q or q == "list":
+        wins = screens.list_windows()
+        if not wins:
+            return "No windows."
+        return "\n".join(f"{w.process}: {w.title[:40]}" for w in wins[:15])
+
+    parts = q.replace("-", " ").split()
+    verb = parts[0] if parts else ""
+    rest = parts[1:]
+
+    position = None
+    rest_joined = " ".join(rest)
+    for p in _WINDOW_POSITIONS:
+        if p.replace("-", " ") in rest_joined:
+            position = p
+            rest_joined = rest_joined.replace(p.replace("-", " "), "").strip()
+            break
+
+    app = rest_joined.strip()
+    if not app and verb != "list":
+        return "Specify an app name."
+
+    try:
+        if verb in ("move", "snap", "place"):
+            if position:
+                screens.snap_window(app, position)
+            screens.raise_window(app)
+            return f"Moved {app}" + (f" to {position}" if position else "")
+        if verb in ("maximize", "fullscreen", "full"):
+            screens.maximize_window(app)
+            screens.raise_window(app)
+            return f"Maximized {app}"
+        if verb == "minimize":
+            screens.minimize_window(app)
+            return f"Minimized {app}"
+        if verb == "close":
+            screens.close_window(app)
+            return f"Closed {app}"
+        if verb == "focus":
+            screens.focus_app(app)
+            return f"Focused {app}"
+        return f"Unknown window verb: {verb}"
+    except Exception as e:
+        return f"Window error: {str(e)[:80]}"
+
+
 def handle_tool(action: str, query: str = "") -> tuple[str, bool]:
     """
     Execute tool. Returns (result_text, is_long).
@@ -198,30 +260,19 @@ def handle_tool(action: str, query: str = "") -> tuple[str, bool]:
         return "Going to sleep.", False
 
     elif action in ("browse", "search", "navigate"):
-        # Determine destination
-        q = query.lower()
-        if "image" in q:
-            dest = "google images"
-        elif "news" in q:
-            dest = "google news"
-        elif "map" in q:
-            dest = "google maps"
-        elif any(site in q for site in ["gmail", "shopify", "figma", "youtube", "github"]):
-            dest = q.split()[0] if q else "google"
-        elif action == "browse" and query:
-            dest = query
-        else:
-            dest = "google"
-
-        # Start browser
+        # No hardcoded destination map — pass the user's query through.
+        # The inner nav agent decides where to go from the query itself.
         try:
             from browser import ensure_browser
             ensure_browser()
         except Exception as e:
             return f"Browser error: {str(e)[:100]}", False
 
-        result = _run_nav_claude(dest, query)
+        result = _run_nav_claude(query or "google", query)
         return result[:SHORT_RESULT_LIMIT], False
+
+    elif action == "window":
+        return _handle_window(query), False
 
     elif action in ("calendar", "email", "reminders"):
         _sync_management(action)
