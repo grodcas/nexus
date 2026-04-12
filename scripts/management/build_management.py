@@ -12,6 +12,9 @@ navigates top-down. root.md is the entry point.
 import json
 import os
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+
+EMAIL_BRIEFING_CHAR_CAP = 400
 
 RAW_DIR = os.path.expanduser("~/.nexus/management/raw")
 OUT_DIR = os.path.expanduser("~/.nexus/management")
@@ -155,52 +158,50 @@ def build_email_md(data: dict) -> str:
     threads = data.get("threads", [])
     unread_count = data.get("unread_count", 0)
 
-    lines = [f"# Email ({data.get('account', 'unknown')})\n"]
-    lines.append(f"Last synced: {data.get('synced_at', 'unknown')}")
-    lines.append(f"Threads: {len(threads)} | Unread: {unread_count}\n")
+    today = datetime.now().date()
 
-    # Separate unread and read
-    unread = [t for t in threads if t.get("unread")]
-    read = [t for t in threads if not t.get("unread")]
+    def thread_date(t):
+        raw = t.get("last_date") or t.get("date") or ""
+        try:
+            return parsedate_to_datetime(raw).astimezone().date()
+        except (TypeError, ValueError):
+            return None
+
+    todays = [t for t in threads if thread_date(t) == today]
 
     def format_thread(t):
         subject = t.get("subject", "(no subject)")
         frm = t.get("from", "?")
-        # Clean up "Name <email>" to just "Name"
         if "<" in frm:
             frm = frm.split("<")[0].strip().strip('"')
-        count = t.get("message_count", 1)
-        snippet = t.get("snippet", "")[:100]
-        date = t.get("last_date", t.get("date", ""))
-        # Simplify date to just date portion if possible
-        if date and "," in date:
-            date = date.split(",")[-1].strip()[:12]
+        return f"- {subject} — {frm}"
 
-        line = f"- **{subject}**"
-        if count > 1:
-            line += f" ({count} msgs)"
-        line += f"\n  From: {frm} | {date}"
-        if snippet:
-            line += f"\n  > {snippet}"
-        return line
+    header = (
+        f"# Email ({data.get('account', 'unknown')})\n\n"
+        f"Last synced: {data.get('synced_at', 'unknown')}\n"
+        f"Threads: {len(threads)} | Unread: {unread_count}\n\n"
+        f"## Today\n\n"
+    )
 
-    lines.append("## Unread\n")
-    if unread:
-        for t in unread:
-            lines.append(format_thread(t))
-            lines.append("")
-    else:
-        lines.append("No unread emails.\n")
+    if not todays:
+        return header + "No emails today.\n"
 
-    lines.append("## Recent\n")
-    if read:
-        for t in read[:30]:  # Cap at 30 recent
-            lines.append(format_thread(t))
-            lines.append("")
-    else:
-        lines.append("No recent emails.\n")
+    body_lines = []
+    used = 0
+    shown = 0
+    for t in todays:
+        line = format_thread(t)
+        if used + len(line) + 1 > EMAIL_BRIEFING_CHAR_CAP:
+            break
+        body_lines.append(line)
+        used += len(line) + 1
+        shown += 1
 
-    return "\n".join(lines) + "\n"
+    remaining = len(todays) - shown
+    if remaining > 0:
+        body_lines.append(f"(+{remaining} more today)")
+
+    return header + "\n".join(body_lines) + "\n"
 
 
 def build_root_md(cal_data: dict, rem_data: dict, email_data: dict) -> str:
@@ -244,16 +245,35 @@ def build_root_md(cal_data: dict, rem_data: dict, email_data: dict) -> str:
             lines.append(f"- {r.get('title', 'Untitled')}")
         lines.append("")
 
-    # Unread email highlights
-    if unread_count > 0:
-        lines.append("## Unread Email Highlights\n")
-        threads = email_data.get("threads", [])
-        for t in threads:
-            if t.get("unread"):
-                frm = t.get("from", "?")
-                if "<" in frm:
-                    frm = frm.split("<")[0].strip().strip('"')
-                lines.append(f"- **{t.get('subject', '(no subject)')}** from {frm}")
+    # Today's emails (matches email.md filtering)
+    today_date = datetime.now().date()
+    threads = email_data.get("threads", [])
+    todays_emails = []
+    for t in threads:
+        raw = t.get("last_date") or t.get("date") or ""
+        try:
+            if parsedate_to_datetime(raw).astimezone().date() == today_date:
+                todays_emails.append(t)
+        except (TypeError, ValueError):
+            continue
+
+    if todays_emails:
+        lines.append("## Today's Emails\n")
+        used = 0
+        shown = 0
+        for t in todays_emails:
+            frm = t.get("from", "?")
+            if "<" in frm:
+                frm = frm.split("<")[0].strip().strip('"')
+            line = f"- {t.get('subject', '(no subject)')} — {frm}"
+            if used + len(line) + 1 > EMAIL_BRIEFING_CHAR_CAP:
+                break
+            lines.append(line)
+            used += len(line) + 1
+            shown += 1
+        remaining = len(todays_emails) - shown
+        if remaining > 0:
+            lines.append(f"(+{remaining} more today)")
         lines.append("")
 
     lines.append("## Detail Files\n")
