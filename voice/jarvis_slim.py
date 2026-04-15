@@ -1429,20 +1429,51 @@ async def main():
                     config=config,
                 ) as session:
 
+                    # Pre-compute one chunk of silence (all zeros)
+                    # for the mic-gate keepalive path below. 16-bit
+                    # mono PCM at 16 kHz, same shape as real mic
+                    # chunks so the server can't tell the difference
+                    # at the framing layer. Gemini's VAD ignores
+                    # silence so it never triggers a response or
+                    # feeds into the feedback loop.
+                    silence_chunk = b"\x00" * (CHUNK * 2)
+                    last_sent_ts = 0.0
+
                     async def send_audio():
+                        nonlocal last_sent_ts
                         loop = asyncio.get_event_loop()
                         while True:
                             data = await loop.run_in_executor(None, mic.read, CHUNK, False)
-                            # Mic gate — suppress while Gemini or
-                            # local TTS is speaking so the mic
-                            # doesn't echo its own voice back into
-                            # the Live session and trigger a
-                            # feedback loop.
+                            now = time.monotonic()
+                            # Mic gate — suppress live mic audio
+                            # while Gemini or local TTS is
+                            # speaking so the mic doesn't echo
+                            # its own voice back into the Live
+                            # session (feedback loop fix).
                             if _mic_should_be_muted():
+                                # Keepalive: if the gate has been
+                                # closed for >500 ms without any
+                                # outbound frame, push a silent
+                                # chunk so the server sees the
+                                # stream is alive. Prevents
+                                # "keepalive ping timeout" 1011s
+                                # during long tool calls (browse
+                                # inner Claude subprocess takes
+                                # 15-25s and the mic gate would
+                                # otherwise go fully idle).
+                                if (now - last_sent_ts) > 0.5:
+                                    await session.send_realtime_input(
+                                        audio=types.Blob(
+                                            data=silence_chunk,
+                                            mime_type="audio/pcm;rate=16000",
+                                        )
+                                    )
+                                    last_sent_ts = now
                                 continue
                             await session.send_realtime_input(
                                 audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                             )
+                            last_sent_ts = now
 
                     # Phase 1E — rolling transcript buffer for the
                     # current user turn. Reset whenever the turn ends.
