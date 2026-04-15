@@ -957,23 +957,79 @@ def _kill_active_tts() -> None:
     _ACTIVE_TTS = None
 
 
-def tts_speak_long(text: str) -> None:
-    """
-    Fire-and-forget speech of `text` via macOS `say`. Returns
-    immediately — does NOT wait for `say` to finish playing.
+# Google Cloud TTS voice for long results (briefing / calendar /
+# email / reminders / documents). Chirp3-HD-Aoede is the Cloud TTS
+# equivalent of the Gemini Live Aoede voice we use for
+# conversational audio, so briefing speech matches the rest of the
+# product. Override via NEXUS_TTS_CLOUD_VOICE in .env if you want
+# a different Chirp3 HD voice — see `gcloud text-to-speech voices
+# list` for the full catalog (Puck, Charon, Kore, Fenrir, etc).
+_CLOUD_TTS_VOICE = os.environ.get("NEXUS_TTS_CLOUD_VOICE", "en-US-Chirp3-HD-Aoede")
+_CLOUD_TTS_SAMPLE_RATE = 24000  # Chirp3 HD default
+_CLOUD_TTS_ENABLED = os.environ.get("NEXUS_TTS_CLOUD", "1").lower() not in ("0", "false", "no")
 
-    This is load-bearing for Gemini Live flow control: the caller
-    MUST be able to return "Done. Already spoken to user." to Gemini
-    within ~100ms of dispatching the tool, otherwise the mic-side
-    audio backlog overflows and Gemini drops the websocket with
-    1011 (happened in the live-run regression on 2026-04-15).
+
+def _speak_via_cloud_tts(text: str) -> None:
+    """
+    Synthesize `text` via Google Cloud TTS (Chirp3-HD-Aoede by
+    default) and play it through afplay as a background subprocess.
+    Runs in its own thread so tts_speak_long can return instantly.
+    Sets _ACTIVE_TTS to the afplay Popen so _kill_active_tts() can
+    interrupt mid-playback. Falls back to macOS `say` on any error.
     """
     global _ACTIVE_TTS
-    if not text:
-        return
-    # Kill any in-flight briefing/calendar playback — a new tool
-    # result supersedes the old speech.
-    _kill_active_tts()
+    try:
+        from google.cloud import texttospeech  # type: ignore
+        from audio import get_tts  # type: ignore
+
+        client = get_tts()
+        resp = client.synthesize_speech(
+            input=texttospeech.SynthesisInput(text=text),
+            voice=texttospeech.VoiceSelectionParams(
+                language_code="en-US",
+                name=_CLOUD_TTS_VOICE,
+            ),
+            audio_config=texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=_CLOUD_TTS_SAMPLE_RATE,
+                speaking_rate=1.0,
+            ),
+        )
+        audio_bytes = resp.audio_content
+
+        # Wrap headerless LINEAR16 PCM as a WAV for afplay.
+        import tempfile
+        import wave
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav", delete=False, prefix="nexus-tts-",
+        ) as f:
+            wav_path = f.name
+        with wave.open(wav_path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(_CLOUD_TTS_SAMPLE_RATE)
+            w.writeframes(audio_bytes)
+
+        # Fire afplay non-blocking. The tempfile is leaked on purpose
+        # — afplay may still be reading it. macOS cleans /tmp on
+        # reboot; if we care, add a cleanup thread that unlinks after
+        # the Popen exits.
+        proc = subprocess.Popen(
+            ["afplay", wav_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _ACTIVE_TTS = proc
+        logger.info(f"cloud TTS playing ({_CLOUD_TTS_VOICE}, {len(text)} chars)")
+    except Exception as e:
+        logger.warning(f"Google Cloud TTS failed ({e}); falling back to say")
+        _speak_via_say(text)
+
+
+def _speak_via_say(text: str) -> None:
+    """Fallback: macOS `say` pipe-stdin, same shape as before."""
+    global _ACTIVE_TTS
     try:
         cmd = ["say", "-r", _TTS_RATE]
         voice = _pick_voice()
@@ -986,18 +1042,50 @@ def tts_speak_long(text: str) -> None:
             stderr=subprocess.DEVNULL,
         )
         _ACTIVE_TTS = proc
-        # Push the text into stdin and close the pipe. `say` buffers
-        # the input internally and plays it from there — we do NOT
-        # call proc.communicate() because that would block until
-        # playback finishes. The kernel pipe buffer (~64 KB) is far
-        # larger than any realistic briefing (callers cap at 3000
-        # chars), so the write returns immediately.
         assert proc.stdin is not None
         proc.stdin.write(text.encode("utf-8"))
         proc.stdin.close()
     except Exception as e:
-        logger.error(f"tts_speak_long failed: {e}")
+        logger.error(f"say fallback failed: {e}")
         _ACTIVE_TTS = None
+
+
+def tts_speak_long(text: str) -> None:
+    """
+    Fire-and-forget long-form speech. Returns immediately — does
+    NOT wait for synthesis or playback to finish.
+
+    Load-bearing for Gemini Live flow control: the caller must
+    return "Done. Already spoken to user." to Gemini within a few
+    hundred ms, otherwise the mic audio backlog overflows and
+    Gemini drops the websocket with 1011. Synth+play happens on
+    a daemon thread so neither step blocks the receive loop.
+
+    Path:
+      NEXUS_TTS_CLOUD=1 (default) → Google Cloud TTS Chirp3-HD-Aoede
+      NEXUS_TTS_CLOUD=0           → macOS `say` with the chosen
+                                    Ava Premium / fallback voice
+      On any Cloud TTS error → falls back to `say`.
+    """
+    if not text:
+        return
+    _kill_active_tts()
+
+    if not _CLOUD_TTS_ENABLED:
+        threading.Thread(
+            target=_speak_via_say,
+            args=(text,),
+            daemon=True,
+            name="nexus-tts-say",
+        ).start()
+        return
+
+    threading.Thread(
+        target=_speak_via_cloud_tts,
+        args=(text,),
+        daemon=True,
+        name="nexus-tts-cloud",
+    ).start()
 
 
 # =============================================================================
@@ -1035,6 +1123,19 @@ async def main():
     # Pre-warm the TTS voice lookup — first call to `say -v ?` takes
     # ~140ms; doing it here makes the first real briefing instant.
     asyncio.create_task(asyncio.to_thread(_pick_voice))
+
+    # Pre-warm the Google Cloud TTS client (~500ms first-call init)
+    # so the first real briefing isn't slowed down by it. Cheap to
+    # do as a background task alongside the browser pre-warm.
+    if _CLOUD_TTS_ENABLED:
+        async def _prewarm_cloud_tts():
+            try:
+                from audio import get_tts
+                await asyncio.to_thread(get_tts)
+                logger.info("Cloud TTS pre-warmed")
+            except Exception as e:
+                logger.warning(f"Cloud TTS pre-warm failed (will fall back to say): {e}")
+        asyncio.create_task(_prewarm_cloud_tts())
 
     config = types.LiveConnectConfig(
         system_instruction=SYSTEM_PROMPT,
