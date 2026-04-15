@@ -926,7 +926,13 @@ def tts_speak_long(text: str) -> None:
 # =============================================================================
 
 async def main():
-    global _MAIN_LOOP
+    # All module-level flags we assign inside main() must be declared
+    # global up front — otherwise Python treats them as locals across
+    # the whole function, and the nested receive() closure sees a
+    # broken cell. _sleep_requested was silently falling out of scope
+    # before this line was added, which is why sleep mode looked
+    # "exactly like before" — the main loop never saw the flag flip.
+    global _MAIN_LOOP, _sleep_requested, _last_gate_pass_ts
     _MAIN_LOOP = asyncio.get_running_loop()  # used by _maybe_sync's background scheduler
 
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -976,7 +982,6 @@ async def main():
             # Fresh session starts with a closed trust window —
             # the first gated call of the day must carry a real
             # trigger. Prevents ambient-trigger from a previous run.
-            global _last_gate_pass_ts
             _last_gate_pass_ts = 0.0
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
