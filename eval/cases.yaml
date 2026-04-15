@@ -1,0 +1,1211 @@
+# =============================================================================
+# Nexus — Plan 2 eval cases
+# =============================================================================
+#
+# This file is the honest picture of how a drone engineer at Xer
+# Technologies actually uses a voice-driven operational agent. It is
+# NOT a feature-coverage matrix. Cases are grouped by user scenario
+# (morning triage, mid-task lookup, focus setup, …) rather than by
+# tool, because the user doesn't think "I will now invoke the window
+# tool" — they think "get out of my way, I need to code."
+#
+# -----------------------------------------------------------------------------
+# Schema
+# -----------------------------------------------------------------------------
+#
+# Each case is a mapping with these fields:
+#
+#   id:          short unique string (`morning-01`, `search-drone-05`)
+#   bucket:      scenario bucket the case belongs to
+#   utterance:   what the user SAYS, verbatim, with punctuation close to
+#                how Gemini Live's transcription tends to render it
+#   expected:
+#     action:    the `action` arg we expect Gemini to pass to do(),
+#                or null if the right answer is NO tool call
+#                (trivial knowledge, small talk, clarification)
+#     query_contains:
+#                list of lowercase substrings that must appear in the
+#                `query` arg on a correct routing (order-agnostic).
+#                Empty list → only the action name is graded.
+#     session:   the `session` arg, if the action is `code` in the
+#                second step of a handoff; null otherwise
+#   success:
+#     mode:      exact | contains | judge | no_tool
+#     predicate: for `contains`: a lowercase substring the handler
+#                result must include. For `judge`: a one-sentence
+#                rubric for the Haiku grader. For `no_tool`: always
+#                succeeds if no tool call was made.
+#   latency_class: knowledge | briefing | window | documents | search | code
+#   latency_budget_ms:
+#                TTFW ceiling for this case class. Past this, the
+#                case fails the latency axis even if routing and
+#                success are fine.
+#   requires_trigger: true if the utterance should be gated by
+#                the trigger-word hard gate (most tool calls),
+#                false for trivial knowledge / small talk
+#   context:     (optional) list of prior (user, assistant) turns
+#                this case depends on. Used for pronouns, corrections,
+#                and multi-turn flows. The harness replays the prior
+#                turns (without scoring them) before the case's
+#                utterance is sent.
+#   notes:       (optional) freeform rationale for this case's
+#                existence — the reason a future you should NOT delete
+#                it in a cleanup pass
+#
+# -----------------------------------------------------------------------------
+# Scoring discipline
+# -----------------------------------------------------------------------------
+#
+# The harness runs every case N=5 times (configurable) and reports:
+#
+#   routing      — % runs where `action` matches expected.action
+#                  (or no tool call for `no_tool` cases)
+#   task_success — % runs where the success predicate holds
+#   latency      — % runs under latency_budget_ms
+#   stability    — % runs where BOTH routing and success agree
+#                  across all N repetitions
+#
+# A case passes only if ALL four hold ≥ target. Target is 90% for
+# routing+success+stability and 80% for latency (latency has more
+# natural variance).
+#
+# -----------------------------------------------------------------------------
+# Budget rationale (latency_budget_ms, text-mode, Python side only)
+# -----------------------------------------------------------------------------
+#
+# These are HANDLER budgets. STT and TTS latency are added back
+# analytically by the harness (measured once per length bucket). A
+# budget of 2000ms means: handle_tool must return within 2s of the
+# simulated text turn arriving, which, with the fixed STT+TTS
+# offsets, gives the user a perceived response time under ~3s.
+#
+#   knowledge   1500   Gemini answers from its own knowledge; no tool
+#                      call, no handler. Measures routing discipline.
+#   briefing    2000   Post-1C management reads are <5ms, budget is
+#                      generous for the Gemini turn itself.
+#   window      2000   PyObjC reads + osascript write, bounded by
+#                      _process_exists + 5s _osa timeout.
+#   documents   2000   Grep over ~25 markdown files, sub-ms.
+#   search      15000  Inner Claude subprocess dominates. Plan 2
+#                      hybridization will pull this down, but the
+#                      baseline target for Plan 2 completion is 15s.
+#   code        2000   List-sessions path is sub-ms; handoff arming
+#                      returns immediately and the actual Claude
+#                      mode is out of scope for this harness.
+#
+# =============================================================================
+
+version: 1
+date: 2026-04-15
+# Number of repetitions per case when running for stability scoring.
+# Single-pass runs (quick sweep during dev) pass `--repeats=1`.
+default_repeats: 5
+
+buckets:
+  - id: knowledge
+    title: Trivial knowledge — must NOT call a tool
+    rationale: >
+      The single most common class of utterance in any real conversation
+      is not a command — it is a question the model already knows the
+      answer to. If Gemini calls a tool for these, the product feels
+      broken ("why did it open a browser when I asked how TDLAS works?").
+      This bucket exists to catch trigger-word bleed and context-
+      sensitivity bias. No trigger word, no tool call.
+
+  - id: morning
+    title: Morning triage — briefing, calendar, inbox
+    rationale: >
+      The daily ritual of "sit down, find out what today is." A user
+      here wants spoken summaries, not opened apps. Everything in this
+      bucket reads from the pre-synced management worktree.
+
+  - id: focus
+    title: Workspace setup for deep work
+    rationale: >
+      Ginés about to start a coding or writing session. Wants windows
+      moved, apps focused, distractions hidden. Fast, silent, doesn't
+      steal focus.
+
+  - id: lookup
+    title: Mid-task fact lookup (knowledge or live web)
+    rationale: >
+      Writing a report, needs a specific fact. The right tool depends on
+      whether it's something Gemini already knows (answer directly) or
+      something that needs the web (browse). Hardest routing choice in
+      the product — this bucket measures it.
+
+  - id: documents
+    title: Find my own files
+    rationale: >
+      Core "find the thing" pain from the original product brief.
+      Queries the local documents worktree. No specific filenames
+      memorized — the user describes the file by content, date, or
+      project.
+
+  - id: research
+    title: Web research bursts
+    rationale: >
+      You need a datasheet, a regulation, a spec, a benchmark. Inner
+      Claude nav agent drives a visible Chromium. This is the slowest
+      action and therefore the one most in need of an ack and a warm
+      browser.
+
+  - id: code_handoff
+    title: Two-step handoff into Claude Code
+    rationale: >
+      The "connect to project X" flow — first call lists sessions,
+      second call stages the handoff and tears down the Gemini session.
+      Must never fire on ambiguous utterances ("connect the bluetooth"
+      should not trigger a project connect).
+
+  - id: multi_turn
+    title: Pronouns, context carry, follow-ups
+    rationale: >
+      A conversation is a turn sequence. This bucket replays prior
+      turns before the case's utterance so we can test "do it again",
+      "the other one", "also put it on the right".
+
+  - id: correction
+    title: Mid-turn corrections and interrupts
+    rationale: >
+      "No wait, not that one." "Stop, cancel." Tests that Nexus can
+      recover gracefully and that an in-flight TTS can be killed.
+
+  - id: disfluent
+    title: Natural disfluent speech
+    rationale: >
+      Real voice input is full of "um", "uh", "so like", repetitions,
+      restarts. STT delivers these to Gemini as-is. The router must
+      still extract intent.
+
+  - id: compound
+    title: Compound and sequential commands
+    rationale: >
+      "Search for X and put the browser on the right." Tests whether
+      Gemini sequences actions cleanly or picks one and drops the
+      other. Spoiler: this is a known weak spot and most cases here
+      will initially fail.
+
+  - id: small_talk
+    title: Small talk and meta questions
+    rationale: >
+      "How are you?" "What can you do?" "Are you there?" These are
+      social glue, not commands. Must not call a tool, must answer
+      conversationally.
+
+# =============================================================================
+# Cases
+# =============================================================================
+
+cases:
+
+  # ---------------------------------------------------------------------------
+  # Trivial knowledge (10) — NO tool call
+  # ---------------------------------------------------------------------------
+
+  - id: knowledge-01
+    bucket: knowledge
+    utterance: what's the capital of bolivia
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Classic trivial knowledge. Historically a common trigger-word-
+      bleed failure ("bolivia" has no trigger; Gemini sometimes calls
+      search anyway because the context feels question-y).
+
+  - id: knowledge-02
+    bucket: knowledge
+    utterance: how does a TDLAS sensor actually work
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Answer explains tunable diode laser absorption spectroscopy at a basic level — mentions laser, absorption, gas. No tool call." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Technical domain knowledge the user already knows. Answer is
+      from Gemini directly — a tool call here is wrong.
+
+  - id: knowledge-03
+    bucket: knowledge
+    utterance: what's the difference between LiDAR and time of flight
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Answer distinguishes the two. No tool call." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: knowledge-04
+    bucket: knowledge
+    utterance: how tall is the eiffel tower
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: knowledge-05
+    bucket: knowledge
+    utterance: explain brushless motor commutation in one sentence
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "One sentence, mentions stator phases and electronic switching. No tool call." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: knowledge-06
+    bucket: knowledge
+    utterance: who invented the transistor
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: knowledge-07
+    bucket: knowledge
+    utterance: what does EASA stand for
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: contains, predicate: "european union aviation safety agency" }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: Domain-specific acronym; Gemini knows it. No tool call.
+
+  - id: knowledge-08
+    bucket: knowledge
+    utterance: what's heavier, water or diesel
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: knowledge-09
+    bucket: knowledge
+    utterance: say a word that rhymes with orange
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Playful question that must not trigger a browse. Also tests
+      that Gemini's own conversational tone is intact.
+
+  - id: knowledge-10
+    bucket: knowledge
+    utterance: convert 4 kilograms to pounds in your head
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: contains, predicate: "8.8" }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  # ---------------------------------------------------------------------------
+  # Morning triage (8)
+  # ---------------------------------------------------------------------------
+
+  - id: morning-01
+    bucket: morning
+    utterance: jarvis, give me my briefing
+    expected: { action: briefing, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: >
+      The most important case in this bucket. The daily ritual.
+      Must return the cached briefing in <100ms post-Plan-1.
+
+  - id: morning-02
+    bucket: morning
+    utterance: nexus what's on my calendar today
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: morning-03
+    bucket: morning
+    utterance: jarvis anything urgent in my email this morning
+    expected: { action: email, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Tool call is `email`. The spoken summary should include at least one filter word like today/urgent/morning." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: morning-04
+    bucket: morning
+    utterance: jarvis what do I have to do today
+    expected: { action: reminders, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: >
+      Ambiguous — could route to `reminders` or `briefing`. Primary
+      expectation is `reminders` (the todo list) but if the router
+      picks `briefing` that is also acceptable and the harness should
+      allow either on this case. Documented here as a known ambiguity.
+
+  - id: morning-05
+    bucket: morning
+    utterance: nexus read me the day
+    expected: { action: briefing, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: Natural informal phrasing for "briefing".
+
+  - id: morning-06
+    bucket: morning
+    utterance: jarvis what's next on my calendar
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: morning-07
+    bucket: morning
+    utterance: jarvis do I have any meetings before lunch
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Tool call is `calendar`. Spoken summary filters to morning." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: morning-08
+    bucket: morning
+    utterance: jarvis read my inbox
+    expected: { action: email, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Focus / workspace setup (10)
+  # ---------------------------------------------------------------------------
+
+  - id: focus-01
+    bucket: focus
+    utterance: jarvis list my windows
+    expected: { action: window, query_contains: [list], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: focus-02
+    bucket: focus
+    utterance: jarvis put chrome on the left half
+    expected: { action: window, query_contains: [chrome, left], session: null }
+    success: { mode: judge, predicate: "Handler result confirms chrome was moved to the left half, or explains chrome is not open." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: focus-03
+    bucket: focus
+    utterance: jarvis fullscreen the terminal
+    expected: { action: window, query_contains: [terminal], session: null }
+    success: { mode: judge, predicate: "Action is `window` with a maximize/full verb; query references terminal." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: focus-04
+    bucket: focus
+    utterance: jarvis move the browser to the other screen
+    expected: { action: window, query_contains: [browser, other], session: null }
+    success: { mode: judge, predicate: "Action is `window`, query references browser and a screen move." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: focus-05
+    bucket: focus
+    utterance: jarvis close finder
+    expected: { action: window, query_contains: [close, finder], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: focus-06
+    bucket: focus
+    utterance: jarvis minimize everything except slack
+    expected: { action: window, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `window`. Query expresses the intent even if the exact verb is not 'minimize all'. This case is hard by design — we want to see whether the router gets it approximately right." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: >
+      Deliberately a hard case. "Minimize everything except X" has no
+      direct verb in the window handler — expect a partial match or a
+      reasonable failure, not a hang. Tracks whether the router passes
+      the intent through rather than silently dropping it.
+
+  - id: focus-07
+    bucket: focus
+    utterance: jarvis bring slack to the front
+    expected: { action: window, query_contains: [slack, focus], session: null }
+    success: { mode: judge, predicate: "Action is `window`; query expresses focus/bring-to-front for slack." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: focus-08
+    bucket: focus
+    utterance: jarvis put the editor on the left and the terminal on the right
+    expected: { action: window, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `window`. Either a compound query that mentions both halves, or the first half handled and the second reported as not-yet-done. Fails silently if nothing happens." }
+    latency_class: window
+    latency_budget_ms: 2500
+    requires_trigger: true
+    notes: >
+      Compound-within-one-action variant. The handler currently
+      supports one verb per call, so this is a known hard case.
+      Tracked to see if the router splits it or drops half.
+
+  - id: focus-09
+    bucket: focus
+    utterance: jarvis what's open right now
+    expected: { action: window, query_contains: [list], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: Paraphrase of `list` — tests whether the router normalises.
+
+  - id: focus-10
+    bucket: focus
+    utterance: jarvis maximize chrome on the secondary screen
+    expected: { action: window, query_contains: [chrome, secondary], session: null }
+    success: { mode: judge, predicate: "Action is `window`; query has chrome and a secondary-screen reference." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Mid-task lookup (10) — knowledge OR browse
+  # ---------------------------------------------------------------------------
+
+  - id: lookup-01
+    bucket: lookup
+    utterance: jarvis what's the max takeoff mass for EASA open category C2
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Answer gives 4 kg (or 'less than 4 kg'). No tool call — Gemini knows this from training." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      The "don't open a browser for a fact the model already knows"
+      case. If this routes to browse, the trigger gate or system
+      prompt needs a tweak.
+
+  - id: lookup-02
+    bucket: lookup
+    utterance: jarvis explain what VTOL transition means in fixed-wing drones
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Conversational explanation. No tool call." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: lookup-03
+    bucket: lookup
+    utterance: jarvis search for the latest EASA drone regulation update 2026
+    expected: { action: search, query_contains: [easa, 2026], session: null }
+    success: { mode: judge, predicate: "Action is search or browse. Result mentions EASA and a date or topic in 2026." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+    notes: >
+      Time-sensitive, must go to browse. Critical counterexample to
+      lookup-01 — Gemini knows EASA rules up to its training cutoff,
+      but "2026 update" signals fresh data needed.
+
+  - id: lookup-04
+    bucket: lookup
+    utterance: jarvis find me the velodyne puck lite datasheet
+    expected: { action: search, query_contains: [velodyne, datasheet], session: null }
+    success: { mode: judge, predicate: "Action is search or browse. Result is a datasheet URL or specs." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: lookup-05
+    bucket: lookup
+    utterance: jarvis how many grams in a kilogram
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: contains, predicate: "1000" }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: Sanity-check on trivial math.
+
+  - id: lookup-06
+    bucket: lookup
+    utterance: jarvis what's the weather in barcelona
+    expected: { action: search, query_contains: [barcelona, weather], session: null }
+    success: { mode: judge, predicate: "Action is search/browse. Result mentions Barcelona and a temperature or condition." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: lookup-07
+    bucket: lookup
+    utterance: jarvis tell me about the airbus lineup
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Conversational overview of Airbus aircraft lineup. No tool call." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Historical regression case — one of the first prompt-bleed
+      failures recorded in the memory (feedback_jarvis_prompt). Must
+      answer from Gemini's own knowledge.
+
+  - id: lookup-08
+    bucket: lookup
+    utterance: jarvis is the pixhawk 6x still in production
+    expected: { action: search, query_contains: [pixhawk], session: null }
+    success: { mode: judge, predicate: "Action is search or browse. Result addresses current production status." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+    notes: >
+      Time-sensitive. Could go either way but "still in production"
+      phrasing indicates the user wants current data, so search is
+      correct.
+
+  - id: lookup-09
+    bucket: lookup
+    utterance: jarvis what's the specific energy of lithium polymer batteries
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Answer cites a Wh/kg number around 150-250. No tool call." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: lookup-10
+    bucket: lookup
+    utterance: jarvis find the latest paper on drone swarming in civilian airspace
+    expected: { action: search, query_contains: [swarm, drone], session: null }
+    success: { mode: judge, predicate: "Action is search or browse. Result references a specific paper, source, or recent finding." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Find my own files (8)
+  # ---------------------------------------------------------------------------
+
+  - id: documents-01
+    bucket: documents
+    utterance: jarvis find my TDLAS integration report
+    expected: { action: documents, query_contains: [tdlas], session: null }
+    success: { mode: contains, predicate: "tdlas" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: documents-02
+    bucket: documents
+    utterance: jarvis where's the ISR camera specs document
+    expected: { action: documents, query_contains: [isr, camera], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: documents-03
+    bucket: documents
+    utterance: jarvis do I have anything about battery safety
+    expected: { action: documents, query_contains: [battery], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: documents-04
+    bucket: documents
+    utterance: jarvis find the latest flight test report
+    expected: { action: documents, query_contains: [flight, test], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: documents-05
+    bucket: documents
+    utterance: jarvis search for sensor calibration notes
+    expected: { action: documents, query_contains: [sensor, calibration], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: >
+      The word "search" appears in the utterance but the target is
+      the local documents worktree, not the web. Tests whether the
+      router is word-driven ("search → search action") or
+      intent-driven ("find my notes → documents action").
+
+  - id: documents-06
+    bucket: documents
+    utterance: jarvis what files do I have on the design organisation
+    expected: { action: documents, query_contains: [design], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: documents-07
+    bucket: documents
+    utterance: jarvis pull up my notes from the last sensor review
+    expected: { action: documents, query_contains: [sensor, review], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: documents-08
+    bucket: documents
+    utterance: jarvis any docs about PCB layout guidelines
+    expected: { action: documents, query_contains: [pcb], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Research burst (6)
+  # ---------------------------------------------------------------------------
+
+  - id: research-01
+    bucket: research
+    utterance: jarvis search google for high altitude drone endurance records
+    expected: { action: search, query_contains: [drone, endurance], session: null }
+    success: { mode: judge, predicate: "Action is search/browse. Result references a record holder or duration figure." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: research-02
+    bucket: research
+    utterance: jarvis look up the price of a dji mavic 3 pro
+    expected: { action: search, query_contains: [mavic], session: null }
+    success: { mode: judge, predicate: "Action is search/browse. Result gives a price or price range." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: research-03
+    bucket: research
+    utterance: jarvis find the iso 21384 standard for uas
+    expected: { action: search, query_contains: [iso, 21384], session: null }
+    success: { mode: judge, predicate: "Action is search/browse. Result references ISO 21384 or UAS standards." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: research-04
+    bucket: research
+    utterance: jarvis open the easa drone website
+    expected: { action: browse, query_contains: [easa], session: null }
+    success: { mode: judge, predicate: "Action is browse or search. Navigation reaches an EASA-related page." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+    notes: >
+      "Open" is a direct navigation intent. Should route to browse
+      rather than search, though either is acceptable as long as the
+      destination is reached.
+
+  - id: research-05
+    bucket: research
+    utterance: jarvis search for papers on methane leak detection from drones
+    expected: { action: search, query_contains: [methane, drone], session: null }
+    success: { mode: judge, predicate: "Action is search/browse. Result references methane detection or a specific paper." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: research-06
+    bucket: research
+    utterance: jarvis google images of drone lidar setups
+    expected: { action: search, query_contains: [drone, lidar, image], session: null }
+    success: { mode: judge, predicate: "Action is search/browse. Navigation reaches an image-search result." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Code handoff (6)
+  # ---------------------------------------------------------------------------
+
+  - id: code-01
+    bucket: code_handoff
+    utterance: jarvis connect me to nexus
+    expected: { action: code, query_contains: [nexus], session: null }
+    success: { mode: judge, predicate: "Action is `code`. Result lists available sessions for nexus (the two-step handoff's first step)." }
+    latency_class: code
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: code-02
+    bucket: code_handoff
+    utterance: jarvis resume my last nexus session
+    expected: { action: code, query_contains: [nexus], session: last }
+    success: { mode: judge, predicate: "Action is `code` with session='last'. Stages the handoff." }
+    latency_class: code
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: code-03
+    bucket: code_handoff
+    utterance: jarvis start a new coding session on nexus
+    expected: { action: code, query_contains: [nexus], session: new }
+    success: { mode: judge, predicate: "Action is `code` with session='new'." }
+    latency_class: code
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: code-04
+    bucket: code_handoff
+    utterance: jarvis previous session on nexus
+    expected: { action: code, query_contains: [nexus], session: previous }
+    success: { mode: judge, predicate: "Action is `code` with session='previous'." }
+    latency_class: code
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: code-05
+    bucket: code_handoff
+    utterance: connect the bluetooth headphones
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Negative control. "Connect" is the trigger verb for the code
+      action but this utterance has nothing to do with code. Plus
+      there is no trigger word. Must NOT route to code.
+
+  - id: code-06
+    bucket: code_handoff
+    utterance: jarvis what projects can I code on
+    expected: { action: code, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `code` with empty/unknown project; handler returns the list of available projects." }
+    latency_class: code
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: >
+      "list projects" is not a current feature. This case tracks
+      whether the router produces a safe fallback (empty query → list)
+      or fails destructively.
+
+  # ---------------------------------------------------------------------------
+  # Multi-turn (8) — context carry, pronouns, follow-ups
+  # ---------------------------------------------------------------------------
+
+  - id: multi-01
+    bucket: multi_turn
+    utterance: and put it on the right
+    expected: { action: window, query_contains: [right], session: null }
+    success: { mode: judge, predicate: "Action is `window`. Query infers the referent from context — the browser that was just moved." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis put chrome on the left half
+      - assistant: Moved chrome to left
+    notes: >
+      Pronoun carry. "It" refers to chrome from the previous turn.
+      Intentionally lacks a trigger word because continuation turns
+      in natural conversation usually don't repeat it. The gate
+      fall-open behaviour is tested here.
+
+  - id: multi-02
+    bucket: multi_turn
+    utterance: do the same for safari
+    expected: { action: window, query_contains: [safari, left], session: null }
+    success: { mode: judge, predicate: "Action is `window`. Query applies the same verb (left half) to safari." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis put chrome on the left half
+      - assistant: Moved chrome to left
+
+  - id: multi-03
+    bucket: multi_turn
+    utterance: read the first one
+    expected: { action: documents, query_contains: [], session: null }
+    success: { mode: judge, predicate: "The router recognises this as a follow-up on the prior documents result and re-issues a documents query that narrows to the first result. Failing gracefully (asking for clarification) also passes." }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis find my TDLAS integration report
+      - assistant: I found 3 files mentioning TDLAS in your documents
+
+  - id: multi-04
+    bucket: multi_turn
+    utterance: who wrote that
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Conversational answer from Gemini's memory of the last turn. No tool call — this is follow-up on a prior search result, not a new action." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    context:
+      - user: jarvis search for papers on methane leak detection from drones
+      - assistant: Found a 2024 paper by Chen et al on methane detection from quadcopters
+
+  - id: multi-05
+    bucket: multi_turn
+    utterance: now close it
+    expected: { action: window, query_contains: [close], session: null }
+    success: { mode: judge, predicate: "Action is `window` with close verb; referent is the previously-focused app." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis bring slack to the front
+      - assistant: Focused slack
+
+  - id: multi-06
+    bucket: multi_turn
+    utterance: and the next one
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: judge, predicate: "The router routes to calendar (next meeting) or gracefully asks 'next what'. Both pass." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis what's next on my calendar
+      - assistant: At 10 am you have the weekly design review
+
+  - id: multi-07
+    bucket: multi_turn
+    utterance: same thing for tomorrow
+    expected: { action: calendar, query_contains: [tomorrow], session: null }
+    success: { mode: judge, predicate: "Action is `calendar`; query includes 'tomorrow' as the date filter." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis what's on my calendar today
+      - assistant: You have three meetings today
+
+  - id: multi-08
+    bucket: multi_turn
+    utterance: open it
+    expected: { action: browse, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `browse` or `search`; navigation targets the previously-mentioned URL or resource. Asking for clarification also passes." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: false
+    context:
+      - user: jarvis find the velodyne puck lite datasheet
+      - assistant: Found it at velodynelidar.com/products/puck-lite
+
+  # ---------------------------------------------------------------------------
+  # Correction / interrupt (6)
+  # ---------------------------------------------------------------------------
+
+  - id: correction-01
+    bucket: correction
+    utterance: wait no, cancel that, search for the specs instead
+    expected: { action: search, query_contains: [specs], session: null }
+    success: { mode: judge, predicate: "Action is search or browse. Query is the NEW request, not the old one. The cancelled request should not be executed." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: false
+    context:
+      - user: jarvis find the velodyne puck lite datasheet
+      - assistant: Looking
+
+  - id: correction-02
+    bucket: correction
+    utterance: no not that one, the other report
+    expected: { action: documents, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `documents`. Handler either narrows to a different result or asks which other report." }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis find my TDLAS integration report
+      - assistant: Found TDLAS integration report v3
+
+  - id: correction-03
+    bucket: correction
+    utterance: stop reading and open my calendar instead
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `calendar`. A prior long TTS should be killed by the 1G interrupt path before the calendar result is spoken." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis give me my briefing
+      - assistant: "[long briefing in progress]"
+
+  - id: correction-04
+    bucket: correction
+    utterance: scratch that
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Pure cancellation with no replacement. Should be a conversational
+      acknowledgement, not a tool call.
+
+  - id: correction-05
+    bucket: correction
+    utterance: actually make it the right half not the left
+    expected: { action: window, query_contains: [right], session: null }
+    success: { mode: judge, predicate: "Action is `window` with 'right' and the referent from the prior turn." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: false
+    context:
+      - user: jarvis put chrome on the left half
+      - assistant: Moved chrome to left
+
+  - id: correction-06
+    bucket: correction
+    utterance: stop
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    context:
+      - user: jarvis give me my briefing
+      - assistant: "[long briefing in progress]"
+    notes: >
+      A single word "stop" during a briefing. The interrupt path in
+      1G should kill the say subprocess. Routing-wise, nothing — no
+      new tool call should fire.
+
+  # ---------------------------------------------------------------------------
+  # Disfluent speech (8)
+  # ---------------------------------------------------------------------------
+
+  - id: disfluent-01
+    bucket: disfluent
+    utterance: um jarvis can you uh search for drone lidar stuff
+    expected: { action: search, query_contains: [drone, lidar], session: null }
+    success: { mode: judge, predicate: "Action is search/browse, query has drone+lidar, disfluencies ignored." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: disfluent-02
+    bucket: disfluent
+    utterance: so like what was I saying, jarvis what's on my calendar
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: disfluent-03
+    bucket: disfluent
+    utterance: hey jarvis find my um the tdlas report the integration one
+    expected: { action: documents, query_contains: [tdlas], session: null }
+    success: { mode: contains, predicate: "tdlas" }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: disfluent-04
+    bucket: disfluent
+    utterance: jarvis put like put chrome on the left uh half please
+    expected: { action: window, query_contains: [chrome, left], session: null }
+    success: { mode: judge, predicate: "Action is `window` with chrome + left." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: disfluent-05
+    bucket: disfluent
+    utterance: I was thinking uh jarvis what's the capital of bolivia
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Disfluent trivial knowledge. Must still answer without a tool
+      call even though the trigger word is present.
+
+  - id: disfluent-06
+    bucket: disfluent
+    utterance: uhm so jarvis can you search search for the easa 2026 rules
+    expected: { action: search, query_contains: [easa], session: null }
+    success: { mode: judge, predicate: "Action is search/browse; duplicated verb is handled." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+
+  - id: disfluent-07
+    bucket: disfluent
+    utterance: so I was wondering jarvis um give me the briefing
+    expected: { action: briefing, query_contains: [], session: null }
+    success: { mode: contains, predicate: "" }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: disfluent-08
+    bucket: disfluent
+    utterance: jarvis what do I have uh later today I mean this afternoon
+    expected: { action: calendar, query_contains: [afternoon], session: null }
+    success: { mode: judge, predicate: "Action is `calendar` with a time-of-day filter in the query." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Compound / sequential (6) — known hard, expected partial failures
+  # ---------------------------------------------------------------------------
+
+  - id: compound-01
+    bucket: compound
+    utterance: jarvis search for drone lidar and put the browser on the right
+    expected: { action: search, query_contains: [drone, lidar], session: null }
+    success: { mode: judge, predicate: "Primary routing is search. Secondary window op may or may not happen — either a second tool call or a dropped second half. This case measures compound handling, not success." }
+    latency_class: search
+    latency_budget_ms: 15000
+    requires_trigger: true
+    notes: >
+      Compound. Slim currently only dispatches one tool call per
+      turn. Expected outcome: search fires, window op is dropped.
+      This case exists specifically to document that known failure
+      mode.
+
+  - id: compound-02
+    bucket: compound
+    utterance: jarvis read my email then my calendar
+    expected: { action: email, query_contains: [], session: null }
+    success: { mode: judge, predicate: "First tool call is email. Whether calendar follows is not scored." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: compound-03
+    bucket: compound
+    utterance: jarvis find my tdlas report and open it
+    expected: { action: documents, query_contains: [tdlas], session: null }
+    success: { mode: judge, predicate: "First tool call is documents. 'Open it' is a follow-up that may or may not be acted on." }
+    latency_class: documents
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: compound-04
+    bucket: compound
+    utterance: jarvis close finder and bring slack forward
+    expected: { action: window, query_contains: [close, finder], session: null }
+    success: { mode: judge, predicate: "First tool call is window/close on finder. The slack focus may be dropped." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  - id: compound-05
+    bucket: compound
+    utterance: jarvis what's on my calendar and what are my reminders
+    expected: { action: calendar, query_contains: [], session: null }
+    success: { mode: judge, predicate: "First call is calendar OR briefing (briefing would actually answer both, which is correct). Reminders standalone second call not required." }
+    latency_class: briefing
+    latency_budget_ms: 2000
+    requires_trigger: true
+    notes: >
+      This is arguably the right reason to route to `briefing`
+      instead of `calendar` — briefing already contains both.
+      Worth watching whether the router is smart enough.
+
+  - id: compound-06
+    bucket: compound
+    utterance: jarvis maximize the editor then start my briefing
+    expected: { action: window, query_contains: [editor], session: null }
+    success: { mode: judge, predicate: "First call is window/maximize editor. Second briefing call is not scored here." }
+    latency_class: window
+    latency_budget_ms: 2000
+    requires_trigger: true
+
+  # ---------------------------------------------------------------------------
+  # Small talk / meta (6)
+  # ---------------------------------------------------------------------------
+
+  - id: smalltalk-01
+    bucket: small_talk
+    utterance: hey jarvis how are you
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: Social opening. Never a tool call.
+
+  - id: smalltalk-02
+    bucket: small_talk
+    utterance: jarvis are you there
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: smalltalk-03
+    bucket: small_talk
+    utterance: jarvis what can you do
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Conversational summary of capabilities. Does NOT call a tool." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: smalltalk-04
+    bucket: small_talk
+    utterance: thanks jarvis
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+
+  - id: smalltalk-05
+    bucket: small_talk
+    utterance: jarvis go to sleep
+    expected: { action: sleep, query_contains: [], session: null }
+    success: { mode: judge, predicate: "Action is `sleep`. Handler returns a goodbye line." }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      Exception: sleep is ungated, so no trigger word is required,
+      but the trigger word happens to be present here. Tests the
+      sleep path either way.
+
+  - id: smalltalk-06
+    bucket: small_talk
+    utterance: nothing never mind
+    expected: { action: null, query_contains: [], session: null }
+    success: { mode: no_tool, predicate: null }
+    latency_class: knowledge
+    latency_budget_ms: 1500
+    requires_trigger: false
+    notes: >
+      User starts to ask something then changes their mind.
+      Conversational acknowledgement, no action.
