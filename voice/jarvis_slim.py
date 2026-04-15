@@ -31,6 +31,7 @@ from metrics import timed, log_event, mark_cold_warm
 import screens
 
 _handoff: dict = {"project": None, "session": None, "path": None}
+_sleep_requested: bool = False  # set by the sleep action; main loop exits
 
 logger.remove(0)
 logger.add(sys.stderr, level="INFO")
@@ -466,7 +467,15 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
 
     try:
         if action == "sleep":
-            return "Going to sleep.", False
+            # Stage a real shutdown: the receive loop reads this flag
+            # after sending the tool_response, lets the goodbye line
+            # play, then breaks out of the main loop cleanly — same
+            # pattern as the code handoff. Without this, sleep just
+            # printed "Going to sleep." and the session stayed hot,
+            # Gemini then repeating the goodbye on ambient noise.
+            global _sleep_requested
+            _sleep_requested = True
+            return "Goodbye.", False
 
         elif action in ("browse", "search", "navigate"):
             # No hardcoded destination map — pass the user's query through.
@@ -588,7 +597,7 @@ _TTS_VOICE_CANDIDATES: tuple[str, ...] = (
     "Evan (Premium)",
     "Samantha",  # ancient but always present — last resort
 )
-_TTS_RATE = "195"  # macOS say words-per-minute-ish; 200 feels rushed
+_TTS_RATE = "175"  # macOS default; Premium voices (Ava) sound unnatural faster
 
 
 def _pick_voice() -> str | None:
@@ -834,7 +843,16 @@ async def main():
                         while True:
                             async for msg in session.receive():
                                 if msg.data:
-                                    spk.write(msg.data)
+                                    # Mute Gemini's audio while a local
+                                    # TTS bypass is in progress. Without
+                                    # this, Gemini's response to the
+                                    # "Done. Already spoken to user."
+                                    # tool_response plays on top of the
+                                    # local `say` reading the real
+                                    # briefing — the user hears two
+                                    # voices at once.
+                                    if _ACTIVE_TTS is None or _ACTIVE_TTS.poll() is not None:
+                                        spk.write(msg.data)
 
                                 # Accumulate user-side transcription.
                                 sc = getattr(msg, "server_content", None)
@@ -919,6 +937,14 @@ async def main():
                                             await asyncio.sleep(2.5)
                                             return
 
+                                        if _sleep_requested:
+                                            # Let Gemini speak "Goodbye.",
+                                            # then return from the receive
+                                            # loop. The main loop sees the
+                                            # flag and breaks out entirely.
+                                            await asyncio.sleep(1.8)
+                                            return
+
                     send_task = asyncio.create_task(send_audio())
                     recv_task = asyncio.create_task(receive())
                     try:
@@ -951,6 +977,10 @@ async def main():
                     logger.error(f"Claude mode error: {e}")
                 logger.info("Claude mode returned — back to Gemini")
                 continue
+
+            if _sleep_requested:
+                logger.info("Sleep requested — exiting Nexus")
+                break
 
             break
     finally:
