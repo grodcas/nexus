@@ -499,12 +499,19 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
             data = _maybe_sync(action)
             if not data:
                 return f"No {action} data.", False
-            # Long result — TTS speaks it, Gemini gets short confirmation
-            return data[:3000], True
+            # Long result — TTS speaks it, Gemini gets short confirmation.
+            # The cached intro from _ACTION_INTRO plays first (instant,
+            # 0 ms gap), then this body synthesizes while the intro is
+            # still playing, so there's no dead air.
+            body = data[:3000].strip()
+            return body, True
 
         elif action == "briefing":
             data = _maybe_sync("all")
-            return data[:3000], True
+            if not data:
+                return "No briefing data available.", False
+            body = data[:3000].strip()
+            return body, True
 
         elif action == "documents":
             result = _search_worktree(query)
@@ -1021,20 +1028,142 @@ _CLOUD_TTS_VOICE = os.environ.get("NEXUS_TTS_CLOUD_VOICE", "en-US-Chirp3-HD-Aoed
 _CLOUD_TTS_SAMPLE_RATE = 24000  # Chirp3 HD default
 _CLOUD_TTS_ENABLED = os.environ.get("NEXUS_TTS_CLOUD", "1").lower() not in ("0", "false", "no")
 
+# -----------------------------------------------------------------------------
+# Pre-cached intro phrases for smooth tool handovers
+# -----------------------------------------------------------------------------
+#
+# Core UX problem before this: after the user asks for a briefing,
+# Cloud TTS takes 500-1500ms to synthesize. During that gap the
+# product sounds dead ("I talk and then I get a briefing"). The fix
+# is to pre-synthesize short intro phrases at startup, cache them as
+# WAVs on disk, and play the cached intro instantly (0 ms latency)
+# while the body synth happens in parallel. The intro is ~1-2s long
+# so by the time it finishes, the body is already synthesized and
+# ready to play back-to-back. Perceived latency = 0.
+#
+# Cache lives in ~/.nexus/tts_cache/<voice>-<sha>.wav. The hash is
+# over (voice, rate, text) so if the voice or rate changes the
+# cache auto-refreshes. Cache survives across runs so the startup
+# pre-warm is only slow the very first time.
 
-def _speak_via_cloud_tts(text: str) -> None:
+_TTS_CACHE_DIR = os.path.expanduser("~/.nexus/tts_cache")
+_CACHED_WAV: dict[str, str] = {}  # key → path
+
+# Intro phrases by action. Each maps an action name to (key, text)
+# where `key` is the cache lookup and `text` is what gets synthesized.
+_ACTION_INTRO: dict[str, tuple[str, str]] = {
+    "briefing":  ("briefing_intro",  "Here is your briefing for today."),
+    "calendar":  ("calendar_intro",  "Here is your calendar."),
+    "email":     ("email_intro",     "Here are your emails."),
+    "reminders": ("reminders_intro", "Here are your reminders."),
+    "documents": ("documents_intro", "Let me look."),
+}
+
+
+def _cache_key_path(key: str) -> str:
+    import hashlib
+    h = hashlib.sha1(
+        f"{_CLOUD_TTS_VOICE}|{_CLOUD_TTS_SAMPLE_RATE}|{key}".encode()
+    ).hexdigest()[:12]
+    return os.path.join(_TTS_CACHE_DIR, f"{key}-{h}.wav")
+
+
+def _synth_to_wav_path(text: str, out_path: str) -> None:
+    """Synthesize `text` to Cloud TTS and write a LINEAR16 WAV at out_path."""
+    from google.cloud import texttospeech  # type: ignore
+    from audio import get_tts  # type: ignore
+    import wave
+    client = get_tts()
+    resp = client.synthesize_speech(
+        input=texttospeech.SynthesisInput(text=text),
+        voice=texttospeech.VoiceSelectionParams(
+            language_code="en-US",
+            name=_CLOUD_TTS_VOICE,
+        ),
+        audio_config=texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=_CLOUD_TTS_SAMPLE_RATE,
+            speaking_rate=1.0,
+        ),
+    )
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with wave.open(out_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(_CLOUD_TTS_SAMPLE_RATE)
+        w.writeframes(resp.audio_content)
+
+
+def _precache_phrase(key: str, text: str) -> None:
     """
-    Synthesize `text` via Google Cloud TTS (Chirp3-HD-Aoede by
-    default) and play it through afplay as a background subprocess.
-    Runs in its own thread so tts_speak_long can return instantly.
-    Sets _ACTIVE_TTS to the afplay Popen so _kill_active_tts() can
-    interrupt mid-playback. Falls back to macOS `say` on any error.
+    Ensure a cached WAV exists for this key. Reuses on-disk cache
+    if the (voice, rate, key) hash matches; synthesizes otherwise.
+    """
+    path = _cache_key_path(key)
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        _CACHED_WAV[key] = path
+        return
+    try:
+        _synth_to_wav_path(text, path)
+        _CACHED_WAV[key] = path
+    except Exception as e:
+        logger.warning(f"precache {key} failed: {e}")
+
+
+def _prewarm_phrases() -> None:
+    """
+    Synthesize every _ACTION_INTRO entry on startup. Called from a
+    background task in main(), so the app stays responsive during
+    the ~3s initial cache build on first run. Subsequent runs are
+    near-instant because the cache is persistent.
+    """
+    for _, (key, text) in _ACTION_INTRO.items():
+        _precache_phrase(key, text)
+    logger.info(f"tts cache ready: {len(_CACHED_WAV)} phrases")
+
+
+def _afplay_popen(path: str) -> subprocess.Popen:
+    """Spawn afplay on a WAV file, non-blocking."""
+    return subprocess.Popen(
+        ["afplay", path],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _speak_via_cloud_tts(text: str, intro_key: str | None = None) -> None:
+    """
+    Play a smooth [cached intro] → [synthesized body] sequence.
+    Runs in its own thread so tts_speak_long returns instantly.
+    Sets _ACTIVE_TTS to whichever subprocess is currently playing
+    so _kill_active_tts() can interrupt either the intro or body.
+    Falls back to macOS `say` on any synth error.
+
+    Flow:
+      t=0     user's question ends, dispatch reaches here
+      t=0     spawn afplay on cached intro WAV (instant, 0 ms gap)
+      t=0     start synth of body in parallel
+      t=~500  synth of body completes, wait for intro to finish
+      t=~1200 intro afplay finishes, spawn body afplay
+      t=~1200 body playback begins, continues for body length
+              no perceptible gap between intro and body
     """
     global _ACTIVE_TTS
     try:
+        import tempfile
+        import wave
         from google.cloud import texttospeech  # type: ignore
         from audio import get_tts  # type: ignore
 
+        # Phase 1 — play cached intro IMMEDIATELY if we have one.
+        intro_proc: subprocess.Popen | None = None
+        if intro_key and intro_key in _CACHED_WAV:
+            intro_path = _CACHED_WAV[intro_key]
+            intro_proc = _afplay_popen(intro_path)
+            _ACTIVE_TTS = intro_proc
+
+        # Phase 2 — synthesize the body in parallel with intro playback.
         client = get_tts()
         resp = client.synthesize_speech(
             input=texttospeech.SynthesisInput(text=text),
@@ -1048,11 +1177,7 @@ def _speak_via_cloud_tts(text: str) -> None:
                 speaking_rate=1.0,
             ),
         )
-        audio_bytes = resp.audio_content
 
-        # Wrap headerless LINEAR16 PCM as a WAV for afplay.
-        import tempfile
-        import wave
         with tempfile.NamedTemporaryFile(
             suffix=".wav", delete=False, prefix="nexus-tts-",
         ) as f:
@@ -1061,19 +1186,20 @@ def _speak_via_cloud_tts(text: str) -> None:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(_CLOUD_TTS_SAMPLE_RATE)
-            w.writeframes(audio_bytes)
+            w.writeframes(resp.audio_content)
 
-        # Fire afplay non-blocking. The tempfile is leaked on purpose
-        # — afplay may still be reading it. macOS cleans /tmp on
-        # reboot; if we care, add a cleanup thread that unlinks after
-        # the Popen exits.
-        proc = subprocess.Popen(
-            ["afplay", wav_path],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        _ACTIVE_TTS = proc
+        # Phase 3 — wait for intro playback to finish, then spawn body.
+        # If the intro was killed externally (_kill_active_tts), its
+        # wait returns immediately; we don't start the body in that
+        # case because the user has moved on.
+        if intro_proc is not None:
+            intro_proc.wait()
+            if intro_proc.returncode not in (0, None):
+                # Intro was killed (SIGTERM / SIGKILL) — don't play body.
+                return
+
+        body_proc = _afplay_popen(wav_path)
+        _ACTIVE_TTS = body_proc
         logger.info(f"cloud TTS playing ({_CLOUD_TTS_VOICE}, {len(text)} chars)")
     except Exception as e:
         logger.warning(f"Google Cloud TTS failed ({e}); falling back to say")
@@ -1103,13 +1229,19 @@ def _speak_via_say(text: str) -> None:
         _ACTIVE_TTS = None
 
 
-def tts_speak_long(text: str) -> None:
+def tts_speak_long(text: str, intro_key: str | None = None) -> None:
     """
     Fire-and-forget long-form speech. Returns immediately — does
     NOT wait for synthesis or playback to finish. Synthesis and
     playback happen on a daemon thread; the caller uses
     _wait_for_tts_done() if it needs to know when playback is
     complete.
+
+    If intro_key is set and matches a cached phrase, play the
+    cached intro instantly as phase 1 of the sequence, then
+    synthesize and play the body. This eliminates the 500-1500ms
+    synth-latency gap at the start of a briefing, because the
+    intro covers the synth time.
 
     Path:
       NEXUS_TTS_CLOUD=1 (default) → Google Cloud TTS Chirp3-HD-Aoede
@@ -1132,7 +1264,7 @@ def tts_speak_long(text: str) -> None:
 
     threading.Thread(
         target=_speak_via_cloud_tts,
-        args=(text,),
+        args=(text, intro_key),
         daemon=True,
         name="nexus-tts-cloud",
     ).start()
@@ -1212,14 +1344,17 @@ async def main():
     asyncio.create_task(asyncio.to_thread(_pick_voice))
 
     # Pre-warm the Google Cloud TTS client (~500ms first-call init)
-    # so the first real briefing isn't slowed down by it. Cheap to
-    # do as a background task alongside the browser pre-warm.
+    # AND pre-cache all the intro phrases so the first real tool
+    # call has a zero-latency intro to play while the body synth
+    # runs. One-time ~3s cost on first run; persistent cache on
+    # disk makes subsequent runs near-instant.
     if _CLOUD_TTS_ENABLED:
         async def _prewarm_cloud_tts():
             try:
                 from audio import get_tts
                 await asyncio.to_thread(get_tts)
                 logger.info("Cloud TTS pre-warmed")
+                await asyncio.to_thread(_prewarm_phrases)
             except Exception as e:
                 logger.warning(f"Cloud TTS pre-warm failed (will fall back to say): {e}")
         asyncio.create_task(_prewarm_cloud_tts())
@@ -1391,27 +1526,37 @@ async def main():
                                         )
 
                                         if is_long:
-                                            # Fire the long-form TTS (non-blocking).
-                                            await asyncio.to_thread(tts_speak_long, result)
-                                            # Wait for the playback to finish BEFORE
-                                            # sending the tool_response. This prevents
-                                            # the race where Gemini starts speaking its
-                                            # "all yours" wrap while local TTS is still
-                                            # synthesizing, gets cut off, then the
-                                            # briefing plays mid-sentence. The mic gate
-                                            # keeps the outbound audio muted during the
-                                            # wait so no backlog accumulates → session
-                                            # stays alive even for long briefings.
+                                            # Fire [cached intro] → [body]
+                                            # sequence. The cached intro plays
+                                            # instantly so there's no dead air
+                                            # after the user's question; the
+                                            # body synthesizes during intro
+                                            # playback for a seamless handoff.
+                                            intro = _ACTION_INTRO.get(action_lc)
+                                            intro_key = intro[0] if intro else None
+                                            await asyncio.to_thread(
+                                                tts_speak_long, result, intro_key,
+                                            )
+                                            # Wait for the full sequence to
+                                            # finish BEFORE sending the
+                                            # tool_response, so Gemini's own
+                                            # wrap (if any) happens strictly
+                                            # after playback — never overlapping.
+                                            # The mic gate keeps the session
+                                            # alive during the wait.
                                             await _wait_for_tts_done()
-                                            # Short, terminal acknowledgement so Gemini
-                                            # can do a clean one-sentence wrap after
-                                            # playback if it wants to, without repeating
-                                            # the briefing content.
+                                            # Strict silence instruction —
+                                            # the user has heard a full, framed
+                                            # spoken result and doesn't need a
+                                            # trailing "anything else?" from
+                                            # Gemini. Stay silent unless the
+                                            # user speaks first.
                                             gemini_result = (
-                                                "The user has already heard the full "
-                                                "result. Do not repeat it. Reply with "
-                                                "at most a short acknowledgement, or "
-                                                "stay silent."
+                                                "The user has already heard the "
+                                                "complete spoken result. Do NOT "
+                                                "reply. Do NOT repeat any content. "
+                                                "Stay silent until the user "
+                                                "speaks again."
                                             )
                                         else:
                                             gemini_result = result
