@@ -467,12 +467,13 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
 
     try:
         if action == "sleep":
-            # Stage a real shutdown: the receive loop reads this flag
-            # after sending the tool_response, lets the goodbye line
-            # play, then breaks out of the main loop cleanly — same
-            # pattern as the code handoff. Without this, sleep just
-            # printed "Going to sleep." and the session stayed hot,
-            # Gemini then repeating the goodbye on ambient noise.
+            # Close the Gemini session and enter a local wake-word
+            # listener. The main loop reads _sleep_requested, tears
+            # down the current Gemini connection, and calls
+            # _wait_for_wake_word() which streams mic audio into
+            # faster-whisper locally (no Gemini cost, no network)
+            # until the user says the wake word again, then reopens
+            # a fresh Gemini session. Ctrl+C is still the real exit.
             global _sleep_requested
             _sleep_requested = True
             return "Goodbye.", False
@@ -750,6 +751,115 @@ def _mark_gate_pass() -> None:
     """Called after an allowed gated tool call — opens the trust window."""
     global _last_gate_pass_ts
     _last_gate_pass_ts = time.monotonic()
+
+
+# =============================================================================
+# Sleep mode — local wake-word listener
+# =============================================================================
+#
+# When the user says "atlas go to sleep", the Gemini session closes
+# (which stops the hot-mic billing and the audio websocket). Then we
+# enter a local listener that reads the mic in ~2s windows, pipes
+# each window to faster-whisper, and checks the transcript for a
+# trigger word. When found, return True so the main loop can open a
+# fresh Gemini session. On KeyboardInterrupt, return False and the
+# main loop breaks out for real.
+#
+# faster-whisper "small" int8 runs at ~300-600ms per 2s window on
+# Apple Silicon — well under the window length, so we never fall
+# behind. First call loads the model (~1-2s); subsequent calls are
+# cached.
+#
+# We do NOT send any audio to Gemini during sleep. Zero network, zero
+# Gemini cost. The speaker is also free — nothing plays until wake.
+
+_SLEEP_WINDOW_S = 2.0       # seconds of audio per whisper call
+_SLEEP_POLL_S = 0.1         # how often to check the transcript buffer
+
+def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
+    """
+    Block until the user says a trigger word, or Ctrl+C.
+
+    Returns True on wake, False on interrupt.
+    """
+    import numpy as np
+
+    try:
+        from audio import get_whisper, transcribe  # type: ignore
+    except Exception as e:
+        logger.error(f"wake listener unavailable: {e}")
+        return False
+
+    # Pre-load Whisper so the first wake window doesn't eat 1-2s on
+    # model init while the user is already talking.
+    try:
+        get_whisper()
+    except Exception as e:
+        logger.error(f"whisper init failed, falling back to exit: {e}")
+        return False
+
+    # Speak a short local confirmation so the user knows sleep mode
+    # is armed (and knows the wake word).
+    trigger_names = ", ".join(sorted(TRIGGER_TOKENS))
+    try:
+        cmd = ["say", "-r", _TTS_RATE]
+        voice = _pick_voice()
+        if voice:
+            cmd += ["-v", voice]
+        cmd.append(f"Sleeping. Say {trigger_names} to wake me.")
+        subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+    logger.info(f"sleeping — waiting for wake word ({trigger_names})")
+
+    mic = pa.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=SAMPLE_RATE,
+        input=True,
+        frames_per_buffer=CHUNK,
+    )
+    try:
+        chunks_per_window = int(SAMPLE_RATE * _SLEEP_WINDOW_S / CHUNK)
+        window: list[bytes] = []
+        while True:
+            try:
+                data = mic.read(CHUNK, exception_on_overflow=False)
+            except KeyboardInterrupt:
+                return False
+            window.append(data)
+            if len(window) < chunks_per_window:
+                continue
+            # Full 2s window — transcribe and check for trigger.
+            audio_bytes = b"".join(window)
+            window = []
+            try:
+                audio_arr = np.frombuffer(audio_bytes, dtype=np.int16)
+                text = transcribe(audio_arr)
+            except Exception as e:
+                logger.warning(f"wake transcribe failed: {e}")
+                continue
+            if not text:
+                continue
+            if _transcript_has_trigger(text):
+                logger.info(f"wake word heard: {text!r}")
+                return True
+            # Slight breath before the next window so we don't pin a
+            # core if whisper ever returns faster than realtime.
+            # (Unlikely at 2s window / 300-600ms whisper, but cheap.)
+            if _SLEEP_POLL_S > 0:
+                time.sleep(_SLEEP_POLL_S)
+    except KeyboardInterrupt:
+        return False
+    finally:
+        try:
+            mic.close()
+        except Exception:
+            pass
 
 
 def _kill_active_tts() -> None:
@@ -1052,8 +1162,18 @@ async def main():
                 continue
 
             if _sleep_requested:
-                logger.info("Sleep requested — exiting Nexus")
-                break
+                # Local wake-word listener. Gemini session is closed
+                # (so no cost, no hot mic), we transcribe the mic
+                # locally with faster-whisper and wait for the
+                # trigger. On wake, reset the flag and reopen a
+                # fresh Gemini session by continuing the outer loop.
+                # On Ctrl+C inside the listener, break for real.
+                _sleep_requested = False
+                woke = await asyncio.to_thread(_wait_for_wake_word, pa)
+                if not woke:
+                    break
+                logger.info("Waking — reopening Gemini session")
+                continue
 
             break
     finally:
