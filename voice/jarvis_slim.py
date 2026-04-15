@@ -689,18 +689,26 @@ def _speak_ack(action: str) -> None:
 # are never touched by the gate — it only intercepts dispatch.
 # =============================================================================
 
-TRIGGER_TOKENS: set[str] = {"nexus", "jarvis"}
-
-# STT-tolerant substring forms. Gemini Live's input transcription
-# occasionally mangles the opening trigger word — seen in the wild
-# as "I request Hey, can you browse..." for what was clearly
-# "hey jarvis, can you browse...". "jarv" and "nexu" are rare
-# enough in English that false positives are effectively zero (no
-# common word starts with either), so expanding the substring set
-# costs nothing and catches the partial-transcription cases.
-_TRIGGER_FUZZY: tuple[str, ...] = (
-    "jarvis", "jarv", "nexus", "nexu",
-)
+# Wake word. "Jarvis" was unreliable in the live-run test —
+# Gemini's STT kept mangling it into things like "I request Hey",
+# which is why we now default to "Atlas". Hard consonants (t-l-s),
+# trained on heavily in every major STT model, not a substring of
+# any common English word, two syllables.
+#
+# Override via NEXUS_TRIGGER_WORDS in .env — comma-separated list
+# of lowercase tokens. Whatever you set is checked as a substring
+# against the transcript (case-insensitive), so pick something
+# that is NOT a substring of common English words. Good: "orion",
+# "vega", "sage", "nova". Bad: "echo" (too common), "halo" ("hall"
+# false positive), "nex" (matches "next").
+_TRIGGER_ENV = os.environ.get("NEXUS_TRIGGER_WORDS", "").strip()
+if _TRIGGER_ENV:
+    _TRIGGER_FUZZY: tuple[str, ...] = tuple(
+        t.strip().lower() for t in _TRIGGER_ENV.split(",") if t.strip()
+    )
+else:
+    _TRIGGER_FUZZY = ("atlas",)
+TRIGGER_TOKENS: set[str] = set(_TRIGGER_FUZZY)  # kept for back-compat w/ tests
 
 ACTION_GATE: set[str] = {
     "browse", "search", "navigate", "documents", "window", "code", "connect",
@@ -951,9 +959,10 @@ async def main():
                                                 action=action_lc,
                                                 transcript_len=len(transcript_snapshot),
                                             )
+                                            trigger_names = ", ".join(sorted(TRIGGER_TOKENS))
                                             gemini_result = (
-                                                "No trigger word heard. "
-                                                "Say jarvis or nexus first."
+                                                f"No trigger word heard. "
+                                                f"Say {trigger_names} first."
                                             )
                                             await session.send_tool_response(
                                                 function_responses=[types.FunctionResponse(
