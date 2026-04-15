@@ -547,20 +547,82 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
 # TTS — for long results that bypass Gemini
 # =============================================================================
 
-# Phase 1G — tts_speak_long correctness.
+# TTS bypass — fire-and-forget macOS `say`, interruptible.
 #
-# The previous implementation silently truncated any text past 500
-# characters because macOS `say` has a hard argv length limit (~255
-# chars) and passing too long an arg rejects silently. Briefings /
-# calendar / reminders frequently exceed 500 chars, so the user was
-# losing most of the content. The fix:
+# Contract (JARVIS_GUIDE rule #6): when a tool returns is_long=True,
+# Nexus must return "Done. Already spoken to user." to Gemini
+# *instantly* so Gemini's audio flow control stays sane, while `say`
+# plays the real content through the speaker in the background. The
+# receive loop must never block on `say` finishing — doing so causes
+# the tool_response to arrive seconds late, the mic audio backlog to
+# overflow, and Gemini Live to drop the websocket with 1011 (learned
+# the hard way by shipping it blocking on 2026-04-15 and watching
+# the first live briefing kill the session).
 #
-#   1. Pipe the full text via stdin so there is no argv limit.
-#   2. Trust upstream truncation — callers already slice to 3000.
-#   3. Track the current say subprocess so a later tool_call can
-#      interrupt the in-flight speech.
+# Design:
+#   1. Start `say` via Popen with stdin=PIPE. No communicate(), no
+#      wait. We push the text into stdin and close the pipe; `say`
+#      plays it from its own buffer.
+#   2. Store the Popen handle in _ACTIVE_TTS so the next tool_call
+#      can call _kill_active_tts() to interrupt (the briefing-in-
+#      progress "never mind, search for X" flow).
+#   3. Voice is set via NEXUS_TTS_VOICE env var or the default
+#      constant below. macOS Premium voices ("Ava (Premium)",
+#      "Zoe (Premium)", "Tom (Premium)") sound dramatically better
+#      than the ancient Samantha default; install via
+#      System Settings → Accessibility → Spoken Content → System
+#      Voice → Manage Voices.
+#   4. No argv length limit because we use stdin — briefings up to
+#      3000 chars pass cleanly (kernel pipe buffer is 64 KB).
 
 _ACTIVE_TTS: subprocess.Popen | None = None
+
+# Override by setting NEXUS_TTS_VOICE=... in .env. First entry that
+# actually exists on this machine is used; falls through to default
+# system voice if none are installed.
+_TTS_VOICE_CANDIDATES: tuple[str, ...] = (
+    os.environ.get("NEXUS_TTS_VOICE", ""),
+    "Ava (Premium)",
+    "Zoe (Premium)",
+    "Tom (Premium)",
+    "Evan (Premium)",
+    "Samantha",  # ancient but always present — last resort
+)
+_TTS_RATE = "195"  # macOS say words-per-minute-ish; 200 feels rushed
+
+
+def _pick_voice() -> str | None:
+    """
+    Pick the first installed voice from the candidate list. Caches
+    the result on first call. Returns None if nothing matches (in
+    which case `say` uses the system default, which is fine).
+    """
+    global _CHOSEN_VOICE
+    if _CHOSEN_VOICE is not None:
+        return _CHOSEN_VOICE or None  # empty string sentinel = no override
+    try:
+        out = subprocess.run(
+            ["say", "-v", "?"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        _CHOSEN_VOICE = ""
+        return None
+    installed = {line.split()[0] if line.strip() else "" for line in out.splitlines()}
+    # `say -v ?` outputs "Ava (Premium)      en_US    # ..." — the name
+    # part may include parens, so use a substring match instead.
+    installed_full = out
+    for candidate in _TTS_VOICE_CANDIDATES:
+        if candidate and candidate in installed_full:
+            _CHOSEN_VOICE = candidate
+            logger.info(f"TTS voice: {candidate}")
+            return candidate
+    _CHOSEN_VOICE = ""
+    logger.info("TTS voice: system default")
+    return None
+
+
+_CHOSEN_VOICE: str | None = None
 
 # Phase 1D — ack-before-await.
 #
@@ -582,8 +644,13 @@ def _speak_ack(action: str) -> None:
     if not line:
         return
     try:
+        cmd = ["say", "-r", _TTS_RATE]
+        voice = _pick_voice()
+        if voice:
+            cmd += ["-v", voice]
+        cmd.append(line)
         subprocess.Popen(
-            ["say", "-r", "220", line],
+            cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -645,31 +712,45 @@ def _kill_active_tts() -> None:
 
 
 def tts_speak_long(text: str) -> None:
-    """Speak long text directly via macOS `say`, full text, no truncation."""
+    """
+    Fire-and-forget speech of `text` via macOS `say`. Returns
+    immediately — does NOT wait for `say` to finish playing.
+
+    This is load-bearing for Gemini Live flow control: the caller
+    MUST be able to return "Done. Already spoken to user." to Gemini
+    within ~100ms of dispatching the tool, otherwise the mic-side
+    audio backlog overflows and Gemini drops the websocket with
+    1011 (happened in the live-run regression on 2026-04-15).
+    """
     global _ACTIVE_TTS
     if not text:
         return
-    # If a previous `say` is still running, kill it — a new tool result
-    # supersedes the old speech.
+    # Kill any in-flight briefing/calendar playback — a new tool
+    # result supersedes the old speech.
     _kill_active_tts()
     try:
+        cmd = ["say", "-r", _TTS_RATE]
+        voice = _pick_voice()
+        if voice:
+            cmd += ["-v", voice]
         proc = subprocess.Popen(
-            ["say", "-r", "200"],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         _ACTIVE_TTS = proc
-        try:
-            # 180s ceiling — long enough for multi-paragraph briefings,
-            # short enough to bound a stuck subprocess.
-            proc.communicate(input=text.encode("utf-8"), timeout=180)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
+        # Push the text into stdin and close the pipe. `say` buffers
+        # the input internally and plays it from there — we do NOT
+        # call proc.communicate() because that would block until
+        # playback finishes. The kernel pipe buffer (~64 KB) is far
+        # larger than any realistic briefing (callers cap at 3000
+        # chars), so the write returns immediately.
+        assert proc.stdin is not None
+        proc.stdin.write(text.encode("utf-8"))
+        proc.stdin.close()
     except Exception as e:
         logger.error(f"tts_speak_long failed: {e}")
-    finally:
         _ACTIVE_TTS = None
 
 
@@ -698,6 +779,10 @@ async def main():
         except Exception as e:
             logger.warning(f"Browser pre-warm failed (continuing): {e}")
     asyncio.create_task(_prewarm_browser())
+
+    # Pre-warm the TTS voice lookup — first call to `say -v ?` takes
+    # ~140ms; doing it here makes the first real briefing instant.
+    asyncio.create_task(asyncio.to_thread(_pick_voice))
 
     config = types.LiveConnectConfig(
         system_instruction=SYSTEM_PROMPT,
