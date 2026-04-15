@@ -588,6 +588,59 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
 
 _ACTIVE_TTS: subprocess.Popen | None = None
 
+# =============================================================================
+# Mic gating — prevent the speaker→mic feedback loop
+# =============================================================================
+#
+# Without headphones, Gemini's own audio output through the laptop
+# speaker is picked up by the laptop mic and streamed back into
+# the Live websocket as "user input". Gemini then processes its
+# own voice as if you had spoken, transcribes it, and generates
+# follow-up turns that sound like it's talking to itself ("did you
+# mean a notification?" → "yes notification, what about it?" →
+# etc.). Classic feedback pathology in every hands-free voice UX.
+#
+# Fix: gate the outbound mic stream whenever EITHER:
+#   (a) a local TTS subprocess is playing (afplay / say), OR
+#   (b) Gemini has sent us audio within the last
+#       _MIC_GATE_TAIL_S seconds (Gemini is mid-utterance or
+#       just finished; the 400 ms tail catches the speaker ring
+#       and the echo bounce).
+#
+# Trade-off: the user loses the ability to "barge in" on Gemini
+# mid-sentence while the gate is active. That's acceptable because
+# the alternative is Gemini talking to itself, which is unusable.
+# Headphones still eliminate the problem entirely and disable the
+# gate's usefulness, but the gate is cheap when not needed so we
+# leave it on by default.
+#
+# Disable via NEXUS_MIC_GATE=0 in .env if you're on headphones
+# and want barge-in back. Tune the tail via NEXUS_MIC_GATE_TAIL_MS.
+
+_MIC_GATE_ENABLED = os.environ.get("NEXUS_MIC_GATE", "1").lower() not in ("0", "false", "no")
+try:
+    _MIC_GATE_TAIL_S = float(os.environ.get("NEXUS_MIC_GATE_TAIL_MS", "400")) / 1000.0
+except ValueError:
+    _MIC_GATE_TAIL_S = 0.4
+_last_gemini_audio_ts: float = 0.0
+
+
+def _mic_should_be_muted() -> bool:
+    """
+    Return True if the outbound mic stream should be suppressed
+    this frame. Called from send_audio() every ~60 ms.
+    """
+    if not _MIC_GATE_ENABLED:
+        return False
+    # Local TTS playing → always mute (briefing / ack lines).
+    if _ACTIVE_TTS is not None and _ACTIVE_TTS.poll() is None:
+        return True
+    # Within tail window after Gemini's last audio chunk → mute.
+    if _last_gemini_audio_ts > 0.0:
+        if (time.monotonic() - _last_gemini_audio_ts) < _MIC_GATE_TAIL_S:
+            return True
+    return False
+
 # Override by setting NEXUS_TTS_VOICE=... in .env. First entry that
 # actually exists on this machine is used; falls through to default
 # system voice if none are installed.
@@ -1099,7 +1152,7 @@ async def main():
     # broken cell. _sleep_requested was silently falling out of scope
     # before this line was added, which is why sleep mode looked
     # "exactly like before" — the main loop never saw the flag flip.
-    global _MAIN_LOOP, _sleep_requested, _last_gate_pass_ts
+    global _MAIN_LOOP, _sleep_requested, _last_gate_pass_ts, _last_gemini_audio_ts
     _MAIN_LOOP = asyncio.get_running_loop()  # used by _maybe_sync's background scheduler
 
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -1166,6 +1219,7 @@ async def main():
             _handoff["session"] = None
             _handoff["path"] = None
             _last_gate_pass_ts = 0.0
+            _last_gemini_audio_ts = 0.0  # mic gate starts open
             _kill_active_tts()  # no leftover say/afplay from prior run
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
@@ -1183,6 +1237,13 @@ async def main():
                         loop = asyncio.get_event_loop()
                         while True:
                             data = await loop.run_in_executor(None, mic.read, CHUNK, False)
+                            # Mic gate — suppress while Gemini or
+                            # local TTS is speaking so the mic
+                            # doesn't echo its own voice back into
+                            # the Live session and trigger a
+                            # feedback loop.
+                            if _mic_should_be_muted():
+                                continue
                             await session.send_realtime_input(
                                 audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                             )
@@ -1192,6 +1253,7 @@ async def main():
                     current_transcript = [""]
 
                     async def receive():
+                        global _last_gemini_audio_ts
                         while True:
                             async for msg in session.receive():
                                 if msg.data:
@@ -1205,6 +1267,12 @@ async def main():
                                     # voices at once.
                                     if _ACTIVE_TTS is None or _ACTIVE_TTS.poll() is not None:
                                         spk.write(msg.data)
+                                        # Mark the moment Gemini put
+                                        # audio through the speaker so
+                                        # the mic gate can suppress
+                                        # outbound input during and
+                                        # just after the utterance.
+                                        _last_gemini_audio_ts = time.monotonic()
 
                                 # Accumulate user-side transcription.
                                 sc = getattr(msg, "server_content", None)
