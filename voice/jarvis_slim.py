@@ -690,25 +690,44 @@ def _speak_ack(action: str) -> None:
 # are never touched by the gate — it only intercepts dispatch.
 # =============================================================================
 
-# Wake word. "Jarvis" was unreliable in the live-run test —
-# Gemini's STT kept mangling it into things like "I request Hey",
-# which is why we now default to "Atlas". Hard consonants (t-l-s),
-# trained on heavily in every major STT model, not a substring of
-# any common English word, two syllables.
+# Wake word / trigger phrase.
+#
+# Lessons from the live-run iterations:
+#   - Single proper-noun wake words ("jarvis", "atlas") are
+#     unreliable with Gemini Live and Whisper STT. Both models
+#     mangle or drop them under real-world audio conditions.
+#   - Multi-word phrases are dramatically more robust because STT
+#     models are trained on phrase-level n-grams, not isolated
+#     tokens. Two common words in sequence transcribe ~100% of
+#     the time.
+#   - The phrase should also be semantically distinctive from
+#     normal desk conversation — "wake up" is perfect: it's what
+#     you'd naturally say to a sleeping agent, it's almost never
+#     said in normal office conversation, and both words are
+#     top-100 English frequency so Whisper/Gemini transcribe them
+#     cleanly.
 #
 # Override via NEXUS_TRIGGER_WORDS in .env — comma-separated list
-# of lowercase tokens. Whatever you set is checked as a substring
-# against the transcript (case-insensitive), so pick something
-# that is NOT a substring of common English words. Good: "orion",
-# "vega", "sage", "nova". Bad: "echo" (too common), "halo" ("hall"
-# false positive), "nex" (matches "next").
+# of lowercase substrings. Each entry is substring-matched against
+# the transcript (case-insensitive). For multi-word entries
+# include the space: "wake up", "listen up".
+#
+# Good alternatives:
+#   "computer"   — Star-Trek classic, single word, 3 syllables
+#   "listen up"  — same phrase-robustness as "wake up"
+#   "attention"  — formal, 3-syllable, distinctive
+#
+# Bad:
+#   "echo"       — too common (false positives)
+#   "halo"       — substring of "hall"
+#   "nex"        — matches "next"
 _TRIGGER_ENV = os.environ.get("NEXUS_TRIGGER_WORDS", "").strip()
 if _TRIGGER_ENV:
     _TRIGGER_FUZZY: tuple[str, ...] = tuple(
         t.strip().lower() for t in _TRIGGER_ENV.split(",") if t.strip()
     )
 else:
-    _TRIGGER_FUZZY = ("atlas",)
+    _TRIGGER_FUZZY = ("wake up",)
 TRIGGER_TOKENS: set[str] = set(_TRIGGER_FUZZY)  # kept for back-compat w/ tests
 
 ACTION_GATE: set[str] = {
