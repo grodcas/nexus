@@ -1106,13 +1106,10 @@ def _speak_via_say(text: str) -> None:
 def tts_speak_long(text: str) -> None:
     """
     Fire-and-forget long-form speech. Returns immediately — does
-    NOT wait for synthesis or playback to finish.
-
-    Load-bearing for Gemini Live flow control: the caller must
-    return "Done. Already spoken to user." to Gemini within a few
-    hundred ms, otherwise the mic audio backlog overflows and
-    Gemini drops the websocket with 1011. Synth+play happens on
-    a daemon thread so neither step blocks the receive loop.
+    NOT wait for synthesis or playback to finish. Synthesis and
+    playback happen on a daemon thread; the caller uses
+    _wait_for_tts_done() if it needs to know when playback is
+    complete.
 
     Path:
       NEXUS_TTS_CLOUD=1 (default) → Google Cloud TTS Chirp3-HD-Aoede
@@ -1139,6 +1136,43 @@ def tts_speak_long(text: str) -> None:
         daemon=True,
         name="nexus-tts-cloud",
     ).start()
+
+
+async def _wait_for_tts_done(
+    max_start_s: float = 3.0,
+    max_total_s: float = 120.0,
+) -> None:
+    """
+    Async-wait until the in-flight long-form TTS has finished
+    playing. Yields to the event loop so receive() and
+    send_audio() keep running while we wait — which is what keeps
+    the session alive and the mic gate effective.
+
+    Two phases:
+      1. Wait up to max_start_s for the background thread to
+         actually start playback (synth + afplay.spawn). If it
+         never starts (synth crashed without setting _ACTIVE_TTS),
+         return early — the caller will send the tool_response
+         anyway so the session doesn't stall.
+      2. Wait up to max_total_s for the playback subprocess to
+         exit. Bounded so a stuck afplay can't hang the session
+         forever.
+    """
+    start = time.monotonic()
+
+    # Phase 1 — wait for playback to start.
+    while _ACTIVE_TTS is None:
+        if (time.monotonic() - start) > max_start_s:
+            return
+        await asyncio.sleep(0.05)
+
+    # Phase 2 — wait for playback to finish.
+    proc = _ACTIVE_TTS
+    while proc is not None and proc.poll() is None:
+        if (time.monotonic() - start) > max_total_s:
+            return
+        await asyncio.sleep(0.15)
+        proc = _ACTIVE_TTS  # could be replaced by a new TTS; refresh
 
 
 # =============================================================================
@@ -1357,8 +1391,28 @@ async def main():
                                         )
 
                                         if is_long:
+                                            # Fire the long-form TTS (non-blocking).
                                             await asyncio.to_thread(tts_speak_long, result)
-                                            gemini_result = "Done. Already spoken to user."
+                                            # Wait for the playback to finish BEFORE
+                                            # sending the tool_response. This prevents
+                                            # the race where Gemini starts speaking its
+                                            # "all yours" wrap while local TTS is still
+                                            # synthesizing, gets cut off, then the
+                                            # briefing plays mid-sentence. The mic gate
+                                            # keeps the outbound audio muted during the
+                                            # wait so no backlog accumulates → session
+                                            # stays alive even for long briefings.
+                                            await _wait_for_tts_done()
+                                            # Short, terminal acknowledgement so Gemini
+                                            # can do a clean one-sentence wrap after
+                                            # playback if it wants to, without repeating
+                                            # the briefing content.
+                                            gemini_result = (
+                                                "The user has already heard the full "
+                                                "result. Do not repeat it. Reply with "
+                                                "at most a short acknowledgement, or "
+                                                "stay silent."
+                                            )
                                         else:
                                             gemini_result = result
 
