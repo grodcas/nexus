@@ -690,45 +690,86 @@ def _speak_ack(action: str) -> None:
 # are never touched by the gate — it only intercepts dispatch.
 # =============================================================================
 
-# Wake word / trigger phrase.
+# =============================================================================
+# Trigger words — two separate sets for two separate jobs
+# =============================================================================
 #
-# Lessons from the live-run iterations:
+# COMMAND TRIGGER (the agent's "name")
+#   Used by the trigger-word gate in active mode. Every first-turn
+#   tool call must have this in the transcript. The trust window
+#   then carries the next ~60s of follow-ups without needing it.
+#
+# WAKE PHRASE (only to leave sleep mode)
+#   Used by the local wake-word listener when Nexus is sleeping.
+#   Ignored by the active-mode gate. Meant to be something you'd
+#   naturally say to a sleeping agent and that Whisper transcribes
+#   reliably (multi-word phrases are best — see below).
+#
+# Lessons from the live iterations:
+#
 #   - Single proper-noun wake words ("jarvis", "atlas") are
-#     unreliable with Gemini Live and Whisper STT. Both models
-#     mangle or drop them under real-world audio conditions.
-#   - Multi-word phrases are dramatically more robust because STT
-#     models are trained on phrase-level n-grams, not isolated
-#     tokens. Two common words in sequence transcribe ~100% of
-#     the time.
-#   - The phrase should also be semantically distinctive from
-#     normal desk conversation — "wake up" is perfect: it's what
-#     you'd naturally say to a sleeping agent, it's almost never
-#     said in normal office conversation, and both words are
-#     top-100 English frequency so Whisper/Gemini transcribe them
-#     cleanly.
+#     unreliable in Gemini Live STT and Whisper small. Both
+#     mangle or drop them under real-world mic conditions.
+#   - Common English words — especially real words that happen to
+#     make sense as names — are dramatically more robust because
+#     they're over-represented in STT training data.
+#   - Multi-word phrases are even more robust because STT models
+#     are trained on phrase-level n-grams. "wake up" as the sleep
+#     phrase transcribes ~100% of the time.
 #
-# Override via NEXUS_TRIGGER_WORDS in .env — comma-separated list
-# of lowercase substrings. Each entry is substring-matched against
-# the transcript (case-insensitive). For multi-word entries
-# include the space: "wake up", "listen up".
+# Default command trigger: "friday"
+#   Real English word (day of the week → top-100 frequency).
+#   Sharp consonants (Fr-, -day), natural to say as an address,
+#   pop-culture safe ("Friday, search for X"), and not a substring
+#   of any common word.
 #
-# Good alternatives:
-#   "computer"   — Star-Trek classic, single word, 3 syllables
-#   "listen up"  — same phrase-robustness as "wake up"
-#   "attention"  — formal, 3-syllable, distinctive
+# Default wake phrase: "wake up"
+#   Semantically literal ("wake the sleeping agent"), both words
+#   top-100 English, rare as a standalone utterance at a desk.
+#
+# Overrides via .env:
+#   NEXUS_COMMAND_TRIGGERS="friday"       # comma-separated, active-mode
+#   NEXUS_WAKE_PHRASES="wake up"          # comma-separated, sleep-mode
+#
+# Back-compat: NEXUS_TRIGGER_WORDS (from the earlier "one trigger
+# for everything" attempt) still works — if set, it populates the
+# command-trigger list as before. New installs should use the new
+# vars.
+#
+# Good alternatives for command trigger:
+#   "computer"  — Star-Trek classic, single word, 3 syllables
+#   "morgan"    — real name, 2 syllables, very STT-reliable
+#   "sage"      — short, distinctive, uncommon at desk
+#   "sonny"     — proper name from pop culture, clear phonemes
 #
 # Bad:
-#   "echo"       — too common (false positives)
-#   "halo"       — substring of "hall"
-#   "nex"        — matches "next"
-_TRIGGER_ENV = os.environ.get("NEXUS_TRIGGER_WORDS", "").strip()
-if _TRIGGER_ENV:
-    _TRIGGER_FUZZY: tuple[str, ...] = tuple(
-        t.strip().lower() for t in _TRIGGER_ENV.split(",") if t.strip()
-    )
-else:
-    _TRIGGER_FUZZY = ("wake up",)
-TRIGGER_TOKENS: set[str] = set(_TRIGGER_FUZZY)  # kept for back-compat w/ tests
+#   "echo"      — too common, false positives everywhere
+#   "halo"      — substring of "hall"
+#   "nex"       — matches "next"
+#   "max"       — too short, ambiguous
+
+def _parse_trigger_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
+
+
+# Command triggers — active mode gate.
+_COMMAND_TRIGGERS: tuple[str, ...] = _parse_trigger_env(
+    "NEXUS_COMMAND_TRIGGERS",
+    _parse_trigger_env("NEXUS_TRIGGER_WORDS", ("friday",)),  # back-compat
+)
+
+# Wake phrases — sleep mode listener only.
+_WAKE_TRIGGERS: tuple[str, ...] = _parse_trigger_env(
+    "NEXUS_WAKE_PHRASES", ("wake up",)
+)
+
+# Kept for back-compat with score.py / eval imports. Points at the
+# active-mode set, which is what the gate uses.
+_TRIGGER_FUZZY: tuple[str, ...] = _COMMAND_TRIGGERS
+TRIGGER_TOKENS: set[str] = set(_COMMAND_TRIGGERS)
 
 ACTION_GATE: set[str] = {
     "browse", "search", "navigate", "documents", "window", "code", "connect",
@@ -751,12 +792,21 @@ _GATE_TRUST_WINDOW_S = 60.0
 _last_gate_pass_ts: float = 0.0
 
 
-def _transcript_has_trigger(transcript: str) -> bool:
-    """Substring check for any configured trigger token, case-insensitive."""
+def _transcript_has_trigger(
+    transcript: str,
+    tokens: tuple[str, ...] = _COMMAND_TRIGGERS,
+) -> bool:
+    """
+    Substring check for any of the given trigger tokens,
+    case-insensitive. Defaults to the active-mode command
+    triggers so existing callers (the active-mode gate) keep
+    working unchanged; the sleep listener passes _WAKE_TRIGGERS
+    explicitly.
+    """
     if not transcript:
         return False
     t = transcript.lower()
-    return any(tok in t for tok in _TRIGGER_FUZZY)
+    return any(tok in t for tok in tokens)
 
 
 def _gate_in_trust_window() -> bool:
@@ -818,14 +868,15 @@ def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
         return False
 
     # Speak a short local confirmation so the user knows sleep mode
-    # is armed (and knows the wake word).
-    trigger_names = ", ".join(sorted(TRIGGER_TOKENS))
+    # is armed (and knows the wake phrase — this is the WAKE set,
+    # NOT the command triggers used in active mode).
+    wake_names = ", ".join(sorted(_WAKE_TRIGGERS))
     try:
         cmd = ["say", "-r", _TTS_RATE]
         voice = _pick_voice()
         if voice:
             cmd += ["-v", voice]
-        cmd.append(f"Sleeping. Say {trigger_names} to wake me.")
+        cmd.append(f"Sleeping. Say {wake_names} to wake me.")
         subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -833,7 +884,7 @@ def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
     except Exception:
         pass
 
-    logger.info(f"sleeping — waiting for wake word ({trigger_names})")
+    logger.info(f"sleeping — waiting for wake phrase ({wake_names})")
 
     mic = pa.open(
         format=pyaudio.paInt16,
@@ -864,8 +915,8 @@ def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
                 continue
             if not text:
                 continue
-            if _transcript_has_trigger(text):
-                logger.info(f"wake word heard: {text!r}")
+            if _transcript_has_trigger(text, _WAKE_TRIGGERS):
+                logger.info(f"wake phrase heard: {text!r}")
                 return True
             # Slight breath before the next window so we don't pin a
             # core if whisper ever returns faster than realtime.
@@ -1093,7 +1144,7 @@ async def main():
                                                 action=action_lc,
                                                 transcript_len=len(transcript_snapshot),
                                             )
-                                            trigger_names = ", ".join(sorted(TRIGGER_TOKENS))
+                                            trigger_names = ", ".join(sorted(_COMMAND_TRIGGERS))
                                             gemini_result = (
                                                 f"No trigger word heard. "
                                                 f"Say {trigger_names} first."
