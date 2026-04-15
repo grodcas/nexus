@@ -1156,13 +1156,17 @@ async def main():
 
     try:
         while True:
+            # Every iteration of this loop is a genuinely fresh
+            # Gemini session — no turn history, no transcript
+            # buffer, no trust window leak from the prior run.
+            # Explicit reset of every piece of per-session state
+            # we touch so waking from sleep is indistinguishable
+            # from a cold start.
             _handoff["project"] = None
             _handoff["session"] = None
             _handoff["path"] = None
-            # Fresh session starts with a closed trust window —
-            # the first gated call of the day must carry a real
-            # trigger. Prevents ambient-trigger from a previous run.
             _last_gate_pass_ts = 0.0
+            _kill_active_tts()  # no leftover say/afplay from prior run
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
                           input=True, frames_per_buffer=CHUNK)
@@ -1350,14 +1354,18 @@ async def main():
                 # Local wake-word listener. Gemini session is closed
                 # (so no cost, no hot mic), we transcribe the mic
                 # locally with faster-whisper and wait for the
-                # trigger. On wake, reset the flag and reopen a
-                # fresh Gemini session by continuing the outer loop.
-                # On Ctrl+C inside the listener, break for real.
+                # wake phrase. On wake, `continue` falls through to
+                # the top of the while loop, which opens a genuinely
+                # fresh Gemini Live session (new WebSocket, new
+                # conversation context, zero shared state with the
+                # pre-sleep session). On Ctrl+C inside the listener,
+                # break out for real.
                 _sleep_requested = False
                 woke = await asyncio.to_thread(_wait_for_wake_word, pa)
                 if not woke:
                     break
-                logger.info("Waking — reopening Gemini session")
+                print("\n  Awake. New Gemini session starting.\n")
+                logger.info("wake — starting fresh Gemini session")
                 continue
 
             break
