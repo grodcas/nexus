@@ -10,6 +10,7 @@ Long tool results bypass Gemini and go straight to TTS.
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -758,7 +759,7 @@ def _parse_trigger_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
 # Command triggers — active mode gate.
 _COMMAND_TRIGGERS: tuple[str, ...] = _parse_trigger_env(
     "NEXUS_COMMAND_TRIGGERS",
-    _parse_trigger_env("NEXUS_TRIGGER_WORDS", ("friday",)),  # back-compat
+    _parse_trigger_env("NEXUS_TRIGGER_WORDS", ("honey",)),  # back-compat
 )
 
 # Wake phrases — sleep mode listener only.
@@ -797,16 +798,24 @@ def _transcript_has_trigger(
     tokens: tuple[str, ...] = _COMMAND_TRIGGERS,
 ) -> bool:
     """
-    Substring check for any of the given trigger tokens,
-    case-insensitive. Defaults to the active-mode command
-    triggers so existing callers (the active-mode gate) keep
-    working unchanged; the sleep listener passes _WAKE_TRIGGERS
-    explicitly.
+    Word-boundary check for any of the given trigger tokens,
+    case-insensitive.
+
+    Word boundaries matter once you pick a common English word
+    as a trigger — plain substring would have "honey" match
+    "honeymoon"/"honeybee"/"honeycomb". We compile a regex
+    that requires \\b on each side of every token so the
+    trigger must appear as its own word (or phrase, for
+    multi-word tokens like "wake up").
+
+    Defaults to the active-mode command triggers; the sleep
+    listener passes _WAKE_TRIGGERS explicitly.
     """
-    if not transcript:
+    if not transcript or not tokens:
         return False
-    t = transcript.lower()
-    return any(tok in t for tok in tokens)
+    # Build the regex lazily-per-call. Small enough to not cache.
+    pattern = r"\b(?:" + "|".join(re.escape(t) for t in tokens) + r")\b"
+    return re.search(pattern, transcript, re.IGNORECASE) is not None
 
 
 def _gate_in_trust_window() -> bool:
