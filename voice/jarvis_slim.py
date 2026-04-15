@@ -49,6 +49,11 @@ CHUNK = 960  # 60ms at 16kHz
 
 # Tool result limits — above this, TTS speaks directly, Gemini gets "Done."
 SHORT_RESULT_LIMIT = 300
+# Browse/search return a richer natural-language summary so Gemini
+# can relay it conversationally. We let this path use up to 800
+# chars so the inner Claude agent can return 2-4 full sentences
+# with concrete facts.
+BROWSE_RESULT_LIMIT = 800
 
 
 # =============================================================================
@@ -269,8 +274,16 @@ def _run_nav_claude(destination, goal):
         f"Use: {venv_python} {nav_script} <cmd>\n"
         f"Commands: state, goto <url>, click \"text\", type \"field\" \"value\", press Enter, scroll down\n"
         "Start with state. Prefer direct URLs over clicking when the site "
-        "exposes a stable URL for the section you need. "
-        "Final response under 150 chars. If login needed say 'Login required'."
+        "exposes a stable URL for the section you need.\n"
+        "\n"
+        "FINAL RESPONSE: write 2 to 4 full sentences that directly answer the "
+        "user's question with the actual facts you found on the page. Include "
+        "concrete numbers, dates, names, or quoted phrases when they appear. "
+        "Do NOT describe the browsing process. Do NOT say 'I navigated to...'. "
+        "Write as if you are telling a friend the answer. Aim for 200 to 500 "
+        "characters. If login is required say 'Login required'. If the page "
+        "did not have the information say 'Not found on that page' and suggest "
+        "one alternative URL to try."
     )
 
     cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json",
@@ -490,7 +503,21 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
                 return f"Browser error: {str(e)[:100]}", False
 
             result = _run_nav_claude(query or "google", query)
-            return result[:SHORT_RESULT_LIMIT], False
+            # Frame the findings so Gemini relays them in a natural
+            # spoken sentence instead of just saying "done" or
+            # dropping the user on a page without an explanation.
+            # This framing lives in the tool_response, NOT the system
+            # prompt, so the Gemini budget discipline is preserved —
+            # these extra tokens only count when search is used.
+            framed = (
+                f"Findings from the web for the user's request "
+                f"'{(query or '').strip()[:120]}':\n\n"
+                f"{result[:BROWSE_RESULT_LIMIT]}\n\n"
+                "Relay this to the user now in 1-3 natural spoken "
+                "sentences. Include the concrete facts above. Do not "
+                "say you searched; just give the answer."
+            )
+            return framed, False
 
         elif action == "window":
             return _handle_window(query), False
