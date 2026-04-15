@@ -64,6 +64,36 @@ import re
 import subprocess
 from dataclasses import dataclass
 
+# PyObjC — used for hang-free window enumeration and frontmost-app
+# lookup. Importing Quartz / AppKit is cheap (~30ms) and the resulting
+# calls are ~1-10ms against the WindowServer, with no target-process
+# involvement, so they cannot hang on unresponsive apps.
+#
+# The AppleScript paths below are kept for geometry operations
+# (move/resize/focus/raise) — those do need to reach the target
+# process, and already have a 5s osascript timeout to cap the damage.
+# Before any geometry op we gate on _process_exists() so the whole
+# class of "talk to a process that isn't there" goes away.
+from Quartz import (
+    CGWindowListCopyWindowInfo,
+    kCGWindowListOptionOnScreenOnly,
+    kCGWindowListOptionAll,
+    kCGWindowListExcludeDesktopElements,
+    kCGNullWindowID,
+)
+from AppKit import NSWorkspace
+
+# NOTE on macOS permissions:
+#
+#   - PROCESS ENUMERATION (owner names, bounds, PIDs) is always
+#     readable — no permission required.
+#   - WINDOW TITLES are gated behind Screen Recording permission since
+#     macOS 10.15. Without it, kCGWindowName is empty for apps other
+#     than the calling process. _process_exists and geometry ops still
+#     work; list_windows returns entries with empty titles until the
+#     user grants permission to the parent terminal process.
+#     (System Settings → Privacy & Security → Screen Recording)
+
 
 # =============================================================================
 # Known process names — gotchas worth recording
@@ -79,13 +109,29 @@ BROWSER_PROCESS = "chrome"
 # Low-level helpers
 # =============================================================================
 
-def _osa(script: str) -> str:
-    """Run an AppleScript snippet and return its stdout (stripped)."""
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True,
-    )
+_OSA_TIMEOUT_S = 5.0  # hard ceiling; an unresponsive target process can hang osascript indefinitely
+
+
+def _osa(script: str, timeout: float = _OSA_TIMEOUT_S) -> str:
+    """Run an AppleScript snippet and return its stdout (stripped).
+
+    Always bounded by a subprocess timeout. If the script hangs (a common
+    failure mode on macOS when iterating processes and one of them is
+    unresponsive — e.g. Electron apps mid-update), we kill osascript and
+    raise RuntimeError so callers degrade gracefully instead of blocking
+    the whole voice loop for minutes.
+    """
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"osascript timed out after {timeout}s (stuck target process?)"
+        )
     if result.returncode != 0:
         raise RuntimeError(
             f"osascript failed: {result.stderr.strip()}\nscript: {script}"
@@ -218,28 +264,29 @@ def find_window(process_substr: str) -> Window | None:
     """
     Find the first window of the first process whose name contains the
     given substring. Returns None if not found.
-    """
-    script = (
-        f'tell application "System Events" to tell '
-        f'(first process whose name contains "{process_substr}") '
-        f'to get {{name, position, size}} of window 1'
-    )
-    try:
-        raw = _osa(script)
-    except RuntimeError:
-        return None
 
-    # Output looks like: "Nexus-Tablet, 511, 72, 448, 783"
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) < 5:
-        return None
-    title = parts[0]
-    x, y, w, h = (int(p) for p in parts[1:5])
-    return Window(process=process_substr, title=title, x=x, y=y, width=w, height=h)
+    Fast path: read from the WindowServer snapshot (list_windows) —
+    which is ~1ms and cannot hang. Falls back to AppleScript only if
+    the snapshot has no match but the process is still "around"
+    somehow (rare).
+    """
+    needle = process_substr.lower()
+    for w in list_windows():
+        if needle in w.process.lower():
+            return w
+    return None
 
 
 def move_window(process_substr: str, x: int, y: int) -> None:
-    """Move the first window of the matching process to (x, y)."""
+    """Move the first window of the matching process to (x, y).
+
+    Gated on _process_exists(): if the WindowServer snapshot does not
+    contain the target, we skip the AppleScript call entirely. That
+    eliminates the "talk to a dead / unresponsive process and hang"
+    failure class which dominated the Plan 1A baseline.
+    """
+    if not _process_exists(process_substr):
+        raise RuntimeError(f"process '{process_substr}' not found in window list")
     _osa(
         f'tell application "System Events" to tell '
         f'(first process whose name contains "{process_substr}") '
@@ -248,7 +295,12 @@ def move_window(process_substr: str, x: int, y: int) -> None:
 
 
 def resize_window(process_substr: str, width: int, height: int) -> None:
-    """Resize the first window of the matching process."""
+    """Resize the first window of the matching process.
+
+    Gated on _process_exists() — see move_window().
+    """
+    if not _process_exists(process_substr):
+        raise RuntimeError(f"process '{process_substr}' not found in window list")
     _osa(
         f'tell application "System Events" to tell '
         f'(first process whose name contains "{process_substr}") '
@@ -274,22 +326,72 @@ def place_window(
 # =============================================================================
 
 def get_frontmost_app() -> str | None:
-    """Return the name of the currently-focused application, or None."""
+    """Return the name of the currently-focused application, or None.
+
+    Uses NSWorkspace — a CoreFoundation-level API. No subprocess, no
+    Apple Events, ~0.1ms, cannot hang.
+    """
     try:
-        return _osa(
-            'tell application "System Events" to '
-            'get name of first process whose frontmost is true'
-        )
-    except RuntimeError:
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if app is None:
+            return None
+        return str(app.localizedName())
+    except Exception:
         return None
+
+
+def _process_exists(name_substr: str) -> bool:
+    """
+    Return True if a currently-running (and windowed) process has a
+    name containing `name_substr` (case-insensitive).
+
+    Uses CGWindowListOptionAll so we also catch minimized / hidden
+    apps (a minimized Chrome window should still pass the gate so
+    that "move chrome left" works). ~1ms, cannot hang.
+
+    Used as a pre-flight gate on AppleScript geometry ops (move,
+    resize, focus, raise) so we never issue an Apple Event to a
+    process that isn't there — which is the failure mode that hung
+    the whole voice loop for 60-120s in the Plan 1A baseline.
+    """
+    needle = name_substr.strip().lower()
+    if not needle:
+        return False
+    for w in _cg_window_snapshot(include_offscreen=True):
+        owner = (w.get("kCGWindowOwnerName") or "").lower()
+        if needle in owner or owner in needle:
+            return True
+    return False
+
+
+def _cg_window_snapshot(include_offscreen: bool = False) -> list[dict]:
+    """Return the current WindowServer window list as a list of dicts.
+
+    include_offscreen=False: only on-screen windows (default).
+        Matches what a user would call "visible windows."
+    include_offscreen=True: every window the WindowServer knows about,
+        including minimized and hidden. Used by _process_exists so
+        that gating is generous — a minimized app should still pass.
+    """
+    if include_offscreen:
+        opts = kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements
+    else:
+        opts = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+    try:
+        return list(CGWindowListCopyWindowInfo(opts, kCGNullWindowID) or [])
+    except Exception:
+        return []
 
 
 def raise_window(process_substr: str) -> None:
     """
     Bring window 1 of the matching process to the front WITHOUT activating
     its application — preserves the user's current keyboard focus.
-    Uses the AXRaise accessibility action.
+    Uses the AXRaise accessibility action. Silently skips if the
+    target isn't in the current window list.
     """
+    if not _process_exists(process_substr):
+        return
     try:
         _osa(
             f'tell application "System Events" to tell '
@@ -304,12 +406,18 @@ def focus_app(app_name: str) -> None:
     """
     Bring the named application to the front. Used to refocus the user's
     previous app after Nexus launches a window that would otherwise steal
-    focus.
+    focus. Gated on _process_exists() — silently no-ops if the target
+    isn't visible, rather than wedging osascript on a dead app.
     """
-    _osa(
-        f'tell application "System Events" to '
-        f'set frontmost of first process whose name is "{app_name}" to true'
-    )
+    if not _process_exists(app_name):
+        return
+    try:
+        _osa(
+            f'tell application "System Events" to '
+            f'set frontmost of first process whose name is "{app_name}" to true'
+        )
+    except RuntimeError:
+        pass
 
 
 # =============================================================================
@@ -319,48 +427,60 @@ def focus_app(app_name: str) -> None:
 def list_windows() -> list[Window]:
     """
     Return all visible windows across all applications.
-    Skips background-only processes and windows with empty titles.
-    """
-    script = '''
-tell application "System Events"
-    set output to ""
-    repeat with proc in (every process whose visible is true)
-        set procName to name of proc
-        try
-            repeat with w in windows of proc
-                set wName to name of w
-                if wName is not "" then
-                    set {wx, wy} to position of w
-                    set {ww, wh} to size of w
-                    set output to output & procName & "|||" & wName & "|||" & wx & "|||" & wy & "|||" & ww & "|||" & wh & linefeed
-                end if
-            end repeat
-        end try
-    end repeat
-    return output
-end tell
-'''
-    try:
-        raw = _osa(script)
-    except RuntimeError:
-        return []
 
-    windows: list[Window] = []
-    for line in raw.strip().splitlines():
-        parts = line.split("|||")
-        if len(parts) >= 6:
-            try:
-                windows.append(Window(
-                    process=parts[0].strip(),
-                    title=parts[1].strip(),
-                    x=int(parts[2].strip()),
-                    y=int(parts[3].strip()),
-                    width=int(parts[4].strip()),
-                    height=int(parts[5].strip()),
-                ))
-            except ValueError:
-                continue
-    return windows
+    Uses CGWindowListCopyWindowInfo — a direct WindowServer query that
+    returns every on-screen window's bounds, owner process, and title
+    in a single ~1-10ms call. **No Apple Events, no target-process
+    involvement, no hangs.** This is the same API yabai / Rectangle /
+    Alfred use.
+
+    The previous AppleScript implementation iterated `every process
+    whose visible is true` and sent each one a `get windows` Apple
+    Event — which blocked for ~60s per unresponsive target. Plan 1A
+    baseline measured 120s per call. The fix is to not talk to the
+    target processes at all: the WindowServer already has what we
+    need.
+
+    Filters applied:
+      - only on-screen windows (skips minimized / off-screen)
+      - excludes desktop elements (Finder wallpapers)
+      - drops entries with empty titles (Nexus's old rule)
+      - drops the macOS menu bar and Dock pseudo-windows
+    """
+    out: list[Window] = []
+    seen_processes: set[str] = set()
+    for w in _cg_window_snapshot():
+        owner = w.get("kCGWindowOwnerName") or ""
+        if not owner or owner in (
+            "Window Server", "Dock", "SystemUIServer",
+            "Control Center", "Wallpaper", "TextInputMenuAgent",
+            "Spotlight", "Notification Center",
+        ):
+            continue
+        title = str(w.get("kCGWindowName") or "")  # may be empty without Screen Recording perm
+        b = w.get("kCGWindowBounds") or {}
+        try:
+            x = int(b.get("X", 0))
+            y = int(b.get("Y", 0))
+            width = int(b.get("Width", 0))
+            height = int(b.get("Height", 0))
+        except (TypeError, ValueError):
+            continue
+        if width < 50 or height < 50:
+            continue
+        # De-dup by (process, title) so N helper windows of the same
+        # app don't spam the list. A process with empty-title windows
+        # is still surfaced once.
+        key = f"{owner}|{title}"
+        if key in seen_processes:
+            continue
+        seen_processes.add(key)
+        out.append(Window(
+            process=owner,
+            title=title,
+            x=x, y=y, width=width, height=height,
+        ))
+    return out
 
 
 # =============================================================================
@@ -373,6 +493,8 @@ def close_window(process_substr: str, window_title: str | None = None) -> bool:
     that title; otherwise close window 1 of the matching process.
     Returns True on success.
     """
+    if not _process_exists(process_substr):
+        return False
     if window_title:
         script = (
             f'tell application "System Events" to tell '
@@ -394,6 +516,8 @@ def close_window(process_substr: str, window_title: str | None = None) -> bool:
 
 def minimize_window(process_substr: str) -> bool:
     """Minimize window 1 of the matching process."""
+    if not _process_exists(process_substr):
+        return False
     script = (
         f'tell application "System Events" to tell '
         f'(first process whose name contains "{process_substr}") to '

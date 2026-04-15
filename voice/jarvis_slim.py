@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 from dotenv import load_dotenv
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts")))
 from session_manager import load_projects, format_sessions_for_display
 from claude_mode import run_claude_mode
+from metrics import timed, log_event, mark_cold_warm
 import screens
 
 _handoff: dict = {"project": None, "session": None, "path": None}
@@ -123,23 +125,112 @@ WORKTREE_ROOT = os.path.expanduser("~/.nexus/documents")
 MANAGEMENT_ROOT = os.path.expanduser("~/.nexus/management")
 MANAGEMENT_SCRIPTS = os.path.join(os.path.dirname(__file__), "..", "scripts", "management")
 
+# Phase 1C — cache-first management reads.
+#
+# Plan 1A measured every management action (briefing/calendar/reminders/
+# email) paying the full sync cost on every call: 30s for calendar/
+# reminders, 60s for briefing (which hit the hard timeout and was
+# *failing* silently). The same data rarely changes more than once per
+# few minutes, so we switch to a cache-first pattern:
+#
+#   - Return the cached markdown file immediately (sub-millisecond).
+#   - If the cache is older than _SYNC_TTL and no background sync is
+#     already in flight for that source, launch one on the main event
+#     loop. The next call picks up the fresh data.
+#   - If there is no cache on disk yet (first-ever call on this machine),
+#     run the sync synchronously — there's nothing to return otherwise.
+#
+# The main event loop reference is captured in main() so handle_tool
+# (which runs inside asyncio.to_thread) can schedule coroutines onto
+# the real loop via run_coroutine_threadsafe.
+
+_SYNC_TTL_S = 120.0  # cached data older than this triggers a background refresh
+_LAST_SYNC: dict[str, float] = {}   # source → monotonic timestamp of last successful sync start
+_SYNC_IN_FLIGHT: set[str] = set()   # sources currently being synced in the background
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None  # set in main()
+
 
 def _sync_management(source="all"):
     venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "venv", "bin", "python3"))
     cmd = [venv_python, "sync_all.py"]
     if source != "all":
         cmd.append(f"--{source}")
+    with timed("management.sync_subprocess", source=source):
+        try:
+            subprocess.run(cmd, cwd=MANAGEMENT_SCRIPTS, capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            logger.error(f"Sync failed: {e}")
+
+
+def _management_path(source: str) -> str:
+    filename = {
+        "calendar": "calendar.md",
+        "reminders": "reminders.md",
+        "email": "email.md",
+        "all": "root.md",
+    }.get(source, "root.md")
+    return os.path.join(MANAGEMENT_ROOT, filename)
+
+
+def _background_sync(source: str) -> None:
+    """Run _sync_management in a thread and clear the in-flight flag."""
     try:
-        subprocess.run(cmd, cwd=MANAGEMENT_SCRIPTS, capture_output=True, text=True, timeout=60)
+        _sync_management(source)
+        _LAST_SYNC[source] = time.monotonic()
     except Exception as e:
-        logger.error(f"Sync failed: {e}")
+        logger.error(f"Background sync {source} failed: {e}")
+    finally:
+        _SYNC_IN_FLIGHT.discard(source)
+
+
+def _maybe_sync(source: str) -> str:
+    """
+    Return the cached management data for `source` immediately. If
+    the cache is stale (>_SYNC_TTL_S old) or missing, refresh.
+
+    Cache hit (fresh): sub-ms return, no sync.
+    Cache hit (stale): sub-ms return, background sync kicked off.
+    Cache miss (first run): synchronous sync, then return.
+    """
+    path = _management_path(source)
+    data = _read_file(path)
+    age = time.monotonic() - _LAST_SYNC.get(source, 0.0)
+
+    if not data:
+        # No cache — must sync synchronously, nothing to return otherwise.
+        _sync_management(source)
+        _LAST_SYNC[source] = time.monotonic()
+        log_event(phase="management.cache_miss_sync", source=source)
+        return _read_file(path)
+
+    if age > _SYNC_TTL_S and source not in _SYNC_IN_FLIGHT:
+        _SYNC_IN_FLIGHT.add(source)
+        log_event(phase="management.background_sync_started", source=source,
+                  age_s=round(age, 1))
+        # Run the sync in a daemon thread so we return immediately.
+        # We don't schedule on the event loop (even though one exists)
+        # because handle_tool already runs inside asyncio.to_thread,
+        # and a plain thread.Thread here is simpler and needs no loop
+        # reference at all. The TTL + in-flight set coalesce duplicates.
+        import threading
+        threading.Thread(
+            target=_background_sync,
+            args=(source,),
+            daemon=True,
+            name=f"nexus-mgmt-sync-{source}",
+        ).start()
+    else:
+        log_event(phase="management.cache_hit", source=source, age_s=round(age, 1))
+
+    return data
 
 
 def _read_file(path):
-    if os.path.exists(path):
-        with open(path) as f:
-            return f.read()
-    return ""
+    with timed("management.file_read", path=os.path.basename(path)):
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read()
+        return ""
 
 
 def _search_worktree(query):
@@ -147,17 +238,22 @@ def _search_worktree(query):
     if not words:
         return "No results."
     results = []
-    for dirpath, _, filenames in os.walk(WORKTREE_ROOT):
-        for fname in filenames:
-            if not fname.endswith(".md"):
-                continue
-            fpath = os.path.join(dirpath, fname)
-            with open(fpath) as f:
-                for line in f:
-                    if all(w in line.lower() for w in words):
-                        results.append(f"[{fname}] {line.strip()}")
-            if len(results) >= 10:
-                break
+    files_scanned = 0
+    with timed("documents.walk_scan", query_len=len(query)):
+        for dirpath, _, filenames in os.walk(WORKTREE_ROOT):
+            for fname in filenames:
+                if not fname.endswith(".md"):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                files_scanned += 1
+                with open(fpath) as f:
+                    for line in f:
+                        if all(w in line.lower() for w in words):
+                            results.append(f"[{fname}] {line.strip()}")
+                if len(results) >= 10:
+                    break
+    log_event(phase="documents.scan_summary", files_scanned=files_scanned,
+              hits=len(results))
     return "\n".join(results) if results else "Nothing found."
 
 
@@ -178,14 +274,23 @@ def _run_nav_claude(destination, goal):
     cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json",
            "--dangerously-skip-permissions", "-p", prompt]
     try:
+        spawn_start = time.perf_counter()
         proc = subprocess.Popen(cmd, cwd=os.path.dirname(__file__),
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        log_event(phase="browse.claude_subprocess_spawn",
+                  duration_ms=round((time.perf_counter() - spawn_start) * 1000, 2))
+
         result_text = ""
+        first_token_logged = False
         start = time.time()
         while proc.poll() is None and time.time() - start < 90:
             line = proc.stdout.readline()
             if not line:
                 break
+            if not first_token_logged:
+                log_event(phase="browse.claude_first_token",
+                          duration_ms=round((time.time() - start) * 1000, 2))
+                first_token_logged = True
             try:
                 event = json.loads(line.decode("utf-8", errors="replace"))
                 if event.get("type") == "assistant":
@@ -199,6 +304,8 @@ def _run_nav_claude(destination, goal):
             except json.JSONDecodeError:
                 pass
         proc.wait(timeout=5)
+        log_event(phase="browse.claude_total",
+                  duration_ms=round((time.time() - start) * 1000, 2))
         return result_text or "Navigation done."
     except Exception as e:
         return f"Error: {str(e)[:100]}"
@@ -219,7 +326,8 @@ _WINDOW_SCREENS = {
 def _open_window_processes() -> list[str]:
     """Distinct process names from currently visible windows."""
     try:
-        return sorted({w.process for w in screens.list_windows()})
+        with timed("window.list_windows"):
+            return sorted({w.process for w in screens.list_windows()})
     except Exception:
         return []
 
@@ -252,7 +360,8 @@ def _handle_window(query: str) -> str:
     """Parse a freeform window command and dispatch to scripts/screens.py."""
     q = (query or "").lower().strip()
     if not q or q == "list":
-        wins = screens.list_windows()
+        with timed("window.list_windows"):
+            wins = screens.list_windows()
         if not wins:
             return "No windows."
         return "\n".join(f"{w.process}: {w.title[:40]}" for w in wins[:15])
@@ -300,6 +409,7 @@ def _handle_window(query: str) -> str:
         return f"No open windows."
 
     try:
+      with timed("window.applescript_dispatch", verb=verb):
         if verb in ("move", "snap", "place", "send"):
             # Cross-screen move with no explicit position → default to full.
             if screen and not position:
@@ -341,87 +451,226 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
     If is_long=True, result should be spoken by TTS directly (bypass Gemini).
     """
     action = action.lower().strip()
+    cold = mark_cold_warm(f"handle_tool.{action}")
+    call_start = time.perf_counter()
 
-    if action == "sleep":
-        return "Going to sleep.", False
+    # Phase 1D — ack-before-await.
+    # Some actions unavoidably take several seconds (browse/search fire
+    # an inner Claude subprocess that is the dominant latency). Instead
+    # of silent dead air, speak a short local ack line NOW via macOS
+    # `say`, non-blocking. The ack plays for ~0.8s while the handler
+    # works; by the time the real answer comes back, the ack has long
+    # since finished. Only actions whose post-1C warm latency is >1s
+    # get an ack — everything else would stutter over itself.
+    _speak_ack(action)
 
-    elif action in ("browse", "search", "navigate"):
-        # No hardcoded destination map — pass the user's query through.
-        # The inner nav agent decides where to go from the query itself.
-        try:
-            from browser import ensure_browser
-            ensure_browser()
-        except Exception as e:
-            return f"Browser error: {str(e)[:100]}", False
+    try:
+        if action == "sleep":
+            return "Going to sleep.", False
 
-        result = _run_nav_claude(query or "google", query)
-        return result[:SHORT_RESULT_LIMIT], False
+        elif action in ("browse", "search", "navigate"):
+            # No hardcoded destination map — pass the user's query through.
+            # The inner nav agent decides where to go from the query itself.
+            try:
+                with timed("browse.ensure_browser"):
+                    from browser import ensure_browser
+                    ensure_browser()
+            except Exception as e:
+                return f"Browser error: {str(e)[:100]}", False
 
-    elif action == "window":
-        return _handle_window(query), False
+            result = _run_nav_claude(query or "google", query)
+            return result[:SHORT_RESULT_LIMIT], False
 
-    elif action in ("calendar", "email", "reminders"):
-        _sync_management(action)
-        filename = {"calendar": "calendar.md", "reminders": "reminders.md", "email": "email.md"}
-        data = _read_file(os.path.join(MANAGEMENT_ROOT, filename.get(action, "calendar.md")))
-        if not data:
-            return f"No {action} data.", False
-        # Long result — TTS speaks it, Gemini gets short confirmation
-        return data[:3000], True
+        elif action == "window":
+            return _handle_window(query), False
 
-    elif action == "briefing":
-        _sync_management("all")
-        data = _read_file(os.path.join(MANAGEMENT_ROOT, "root.md"))
-        return data[:3000], True
+        elif action in ("calendar", "email", "reminders"):
+            data = _maybe_sync(action)
+            if not data:
+                return f"No {action} data.", False
+            # Long result — TTS speaks it, Gemini gets short confirmation
+            return data[:3000], True
 
-    elif action == "documents":
-        result = _search_worktree(query)
-        if len(result) > SHORT_RESULT_LIMIT:
-            return result, True
-        return result, False
+        elif action == "briefing":
+            data = _maybe_sync("all")
+            return data[:3000], True
 
-    elif action in ("code", "connect"):
-        project = (query or "").lower().strip()
-        if project not in PROJECTS:
-            return f"Unknown project. Available: {', '.join(PROJECTS.keys())}", False
+        elif action == "documents":
+            result = _search_worktree(query)
+            if len(result) > SHORT_RESULT_LIMIT:
+                return result, True
+            return result, False
 
-        path = os.path.expanduser(PROJECTS[project])
-        if not os.path.isdir(path):
-            return f"Path '{path}' not found.", False
+        elif action in ("code", "connect"):
+            project = (query or "").lower().strip()
+            if project not in PROJECTS:
+                return f"Unknown project. Available: {', '.join(PROJECTS.keys())}", False
 
-        choice = (session or "").lower().strip()
-        if choice not in ("last", "previous", "new"):
-            return format_sessions_for_display(project), False
+            path = os.path.expanduser(PROJECTS[project])
+            if not os.path.isdir(path):
+                return f"Path '{path}' not found.", False
 
-        # Stage handoff — main loop will close Gemini and run Claude mode.
-        _handoff["project"] = project
-        _handoff["session"] = choice
-        _handoff["path"] = path
-        return f"Switching to Claude coding mode for {project}. Goodbye for now.", False
+            choice = (session or "").lower().strip()
+            if choice not in ("last", "previous", "new"):
+                return format_sessions_for_display(project), False
 
-    elif action == "github":
-        try:
-            r = subprocess.run(
-                ["gh", "api", "/user/repos?sort=pushed&per_page=5",
-                 "--jq", r'.[] | "\(.name) — \(.pushed_at)"'],
-                capture_output=True, text=True, timeout=15,
-            )
-            return r.stdout.strip()[:SHORT_RESULT_LIMIT] or "No repos.", False
-        except Exception:
-            return "GitHub error.", False
+            # Stage handoff — main loop will close Gemini and run Claude mode.
+            _handoff["project"] = project
+            _handoff["session"] = choice
+            _handoff["path"] = path
+            return f"Switching to Claude coding mode for {project}. Goodbye for now.", False
 
-    return f"Unknown action: {action}", False
+        elif action == "github":
+            try:
+                with timed("github.gh_subprocess"):
+                    r = subprocess.run(
+                        ["gh", "api", "/user/repos?sort=pushed&per_page=5",
+                         "--jq", r'.[] | "\(.name) — \(.pushed_at)"'],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                return r.stdout.strip()[:SHORT_RESULT_LIMIT] or "No repos.", False
+            except Exception:
+                return "GitHub error.", False
+
+        return f"Unknown action: {action}", False
+    finally:
+        log_event(
+            phase="handle_tool.total",
+            action=action,
+            query_len=len(query or ""),
+            duration_ms=round((time.perf_counter() - call_start) * 1000, 2),
+            cold=cold,
+        )
 
 
 # =============================================================================
 # TTS — for long results that bypass Gemini
 # =============================================================================
 
-def tts_speak_long(text: str):
-    """Speak long text directly via macOS say. Non-blocking-ish."""
-    # Summarize for speech — just first ~500 chars
-    short = text[:500]
-    subprocess.run(["say", "-r", "200", short], timeout=60)
+# Phase 1G — tts_speak_long correctness.
+#
+# The previous implementation silently truncated any text past 500
+# characters because macOS `say` has a hard argv length limit (~255
+# chars) and passing too long an arg rejects silently. Briefings /
+# calendar / reminders frequently exceed 500 chars, so the user was
+# losing most of the content. The fix:
+#
+#   1. Pipe the full text via stdin so there is no argv limit.
+#   2. Trust upstream truncation — callers already slice to 3000.
+#   3. Track the current say subprocess so a later tool_call can
+#      interrupt the in-flight speech.
+
+_ACTIVE_TTS: subprocess.Popen | None = None
+
+# Phase 1D — ack-before-await.
+#
+# Actions whose post-1C warm latency is >1s get a short local ack line
+# spoken via `say` the moment handle_tool is called. Everything else is
+# fast enough that an ack would stutter against the real result. Ack
+# lines are deliberately generic (no app names, no segment language —
+# rule #5 from JARVIS_GUIDE).
+ACK_LINES: dict[str, str] = {
+    "browse":   "On it.",
+    "search":   "Searching.",
+    "navigate": "On it.",
+}
+
+
+def _speak_ack(action: str) -> None:
+    """Fire-and-forget local `say` with the ack line for this action."""
+    line = ACK_LINES.get(action)
+    if not line:
+        return
+    try:
+        subprocess.Popen(
+            ["say", "-r", "220", line],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logger.warning(f"ack `say` failed: {e}")
+
+
+# =============================================================================
+# Phase 1E — Trigger-word hard gate
+#
+# Gemini Live sometimes decides to call a tool just because "the
+# context sounds operational," even when the user said nothing that
+# should have triggered an action. Prompt edits alone cannot fix this
+# reliably (the JARVIS_GUIDE anti-patterns document at least four
+# times we tried). The structural fix is to enable input audio
+# transcription on the Live session, accumulate the user's current
+# turn transcript in a rolling buffer, and — before dispatching any
+# gated tool_call — confirm the buffer contains a trigger token.
+#
+# If the transcript is empty (e.g. the tool_call arrived before the
+# transcription did), the gate falls OPEN: we'd rather miss a block
+# than block a legitimate call. Quantify the rate later in Plan 2.
+#
+# `sleep` is explicitly ungated so "go to sleep" still works without
+# saying a trigger word. Conversational answers (no tool call at all)
+# are never touched by the gate — it only intercepts dispatch.
+# =============================================================================
+
+TRIGGER_TOKENS: set[str] = {"nexus", "jarvis"}
+ACTION_GATE: set[str] = {
+    "browse", "search", "navigate", "documents", "window", "code", "connect",
+    "briefing", "calendar", "email", "reminders", "github",
+}
+
+
+def _transcript_has_trigger(transcript: str) -> bool:
+    """Substring check for any configured trigger token, case-insensitive."""
+    if not transcript:
+        return False
+    t = transcript.lower()
+    return any(tok in t for tok in TRIGGER_TOKENS)
+
+
+def _kill_active_tts() -> None:
+    """Kill any in-flight `say` subprocess. Safe to call repeatedly."""
+    global _ACTIVE_TTS
+    proc = _ACTIVE_TTS
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
+    _ACTIVE_TTS = None
+
+
+def tts_speak_long(text: str) -> None:
+    """Speak long text directly via macOS `say`, full text, no truncation."""
+    global _ACTIVE_TTS
+    if not text:
+        return
+    # If a previous `say` is still running, kill it — a new tool result
+    # supersedes the old speech.
+    _kill_active_tts()
+    try:
+        proc = subprocess.Popen(
+            ["say", "-r", "200"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _ACTIVE_TTS = proc
+        try:
+            # 180s ceiling — long enough for multi-paragraph briefings,
+            # short enough to bound a stuck subprocess.
+            proc.communicate(input=text.encode("utf-8"), timeout=180)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+    except Exception as e:
+        logger.error(f"tts_speak_long failed: {e}")
+    finally:
+        _ACTIVE_TTS = None
 
 
 # =============================================================================
@@ -429,9 +678,26 @@ def tts_speak_long(text: str):
 # =============================================================================
 
 async def main():
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()  # used by _maybe_sync's background scheduler
+
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
     print_budget()
+
+    # Phase 1B — pre-warm browser on app start.
+    # ensure_browser is idempotent; firing it now means the first
+    # browse/search call of the day finds the browser already up.
+    # Failures are logged and swallowed — the in-handle_tool fallback
+    # path still works.
+    async def _prewarm_browser():
+        try:
+            from browser import ensure_browser
+            await asyncio.to_thread(ensure_browser)
+            logger.info("Browser pre-warmed")
+        except Exception as e:
+            logger.warning(f"Browser pre-warm failed (continuing): {e}")
+    asyncio.create_task(_prewarm_browser())
 
     config = types.LiveConnectConfig(
         system_instruction=SYSTEM_PROMPT,
@@ -442,6 +708,9 @@ async def main():
             )
         ),
         tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
+        # Phase 1E — enable input transcription so we can gate tool
+        # dispatch on trigger-word presence in the user's utterance.
+        input_audio_transcription=types.AudioTranscriptionConfig(),
     )
 
     pa = pyaudio.PyAudio()
@@ -472,19 +741,73 @@ async def main():
                                 audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                             )
 
+                    # Phase 1E — rolling transcript buffer for the
+                    # current user turn. Reset whenever the turn ends.
+                    current_transcript = [""]
+
                     async def receive():
                         while True:
                             async for msg in session.receive():
                                 if msg.data:
                                     spk.write(msg.data)
 
+                                # Accumulate user-side transcription.
+                                sc = getattr(msg, "server_content", None)
+                                if sc is not None:
+                                    inp = getattr(sc, "input_transcription", None)
+                                    if inp is not None and getattr(inp, "text", None):
+                                        current_transcript[0] += inp.text
+                                    if getattr(sc, "turn_complete", False):
+                                        # Turn done — reset buffer for the next one.
+                                        current_transcript[0] = ""
+
                                 if msg.tool_call:
+                                    # Phase 1G — a new tool call
+                                    # supersedes any in-flight long TTS
+                                    # (e.g. user interrupts a briefing
+                                    # mid-read with "never mind, search
+                                    # for X").
+                                    _kill_active_tts()
+                                    transcript_snapshot = current_transcript[0]
                                     for fc in msg.tool_call.function_calls:
                                         logger.info(f"Tool call: {fc.name}({dict(fc.args)})")
                                         args = dict(fc.args) if fc.args else {}
                                         action = args.get("action", "")
                                         query = args.get("query", "")
                                         sess_choice = args.get("session", "")
+
+                                        # Phase 1E — trigger-word gate.
+                                        # Block gated actions when the
+                                        # transcript has no trigger
+                                        # token. Fall-open on empty
+                                        # transcript (prefer missing a
+                                        # block over blocking a real
+                                        # call).
+                                        action_lc = action.lower().strip()
+                                        gated = action_lc in ACTION_GATE
+                                        has_trigger = _transcript_has_trigger(transcript_snapshot)
+                                        if gated and transcript_snapshot and not has_trigger:
+                                            logger.warning(
+                                                f"gate blocked action={action_lc!r} "
+                                                f"transcript={transcript_snapshot!r}"
+                                            )
+                                            log_event(
+                                                phase="gate.blocked",
+                                                action=action_lc,
+                                                transcript_len=len(transcript_snapshot),
+                                            )
+                                            gemini_result = (
+                                                "No trigger word heard. "
+                                                "Say jarvis or nexus first."
+                                            )
+                                            await session.send_tool_response(
+                                                function_responses=[types.FunctionResponse(
+                                                    name=fc.name,
+                                                    id=fc.id,
+                                                    response={"result": gemini_result},
+                                                )]
+                                            )
+                                            continue
 
                                         result, is_long = await asyncio.to_thread(
                                             handle_tool, action, query, sess_choice

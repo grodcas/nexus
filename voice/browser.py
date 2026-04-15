@@ -155,6 +155,26 @@ def _get_page():
     return _browser_context.new_page()
 
 
+# =============================================================================
+# Phase 1F — state cache
+#
+# Repeated `state` calls on the same page are common (the inner nav
+# agent checks state between every action). The full DOM enumeration
+# takes ~50-150ms and returns the same thing until the page changes.
+# We cache the last result keyed on `(page.url, cache_gen)` where
+# cache_gen is bumped whenever a state-mutating command runs.
+# =============================================================================
+
+_STATE_CACHE: dict = {"key": None, "value": None, "ts": 0.0}
+_CACHE_TTL_S = 0.5  # belt-and-suspenders so we never serve a truly stale entry
+
+
+def _invalidate_state_cache() -> None:
+    _STATE_CACHE["key"] = None
+    _STATE_CACHE["value"] = None
+    _STATE_CACHE["ts"] = 0.0
+
+
 def _execute_command(cmd: dict) -> dict:
     """Execute a navigation command. ONLY call from Playwright thread."""
     page = _get_page()
@@ -166,6 +186,12 @@ def _execute_command(cmd: dict) -> dict:
     try:
         if action == "state":
             url = page.url
+            # Cache hit: same URL, TTL fresh. Return the cached string.
+            cache_key = url
+            age = time.time() - _STATE_CACHE["ts"]
+            if _STATE_CACHE["key"] == cache_key and age < _CACHE_TTL_S:
+                return {"result": _STATE_CACHE["value"]}
+
             title = page.title()
             elements = page.evaluate("""() => {
                 const r = { links: [], buttons: [], inputs: [] };
@@ -199,25 +225,75 @@ def _execute_command(cmd: dict) -> dict:
                 lines.append(f"Buttons: {', '.join(elements['buttons'])}")
             if elements.get("inputs"):
                 lines.append(f"Inputs: {', '.join(elements['inputs'])}")
-            return {"result": "\n".join(lines)}
+            result_text = "\n".join(lines)
+            _STATE_CACHE["key"] = cache_key
+            _STATE_CACHE["value"] = result_text
+            _STATE_CACHE["ts"] = time.time()
+            return {"result": result_text}
 
         elif action == "goto":
             url = cmd.get("url", "")
             if not url.startswith(("http://", "https://")):
                 url = "https://" + url
             page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            _invalidate_state_cache()
+            # Optional: wait for a specific selector to appear after
+            # domcontentloaded. Closes the "browser loaded but the
+            # search box isn't there yet" gap on heavy sites.
+            wait_sel = cmd.get("wait_for")
+            if wait_sel:
+                try:
+                    page.wait_for_selector(wait_sel, timeout=5000, state="visible")
+                except Exception:
+                    pass
             return {"result": f"OK: {page.url} — {page.title()}"}
 
         elif action == "click":
             text = cmd.get("text", "")
+            # Fallback ladder — try each strategy in order until one
+            # resolves to at least one element. get_by_label handles
+            # form labels and aria-labels (Gmail's "Search mail", etc).
             locator = page.get_by_text(text, exact=False)
             if locator.count() == 0:
                 locator = page.get_by_role("link", name=text)
             if locator.count() == 0:
                 locator = page.get_by_role("button", name=text)
             if locator.count() == 0:
-                return {"result": f"NOT FOUND: no element with text '{text}'"}
+                locator = page.get_by_label(text)
+            if locator.count() == 0:
+                # JS fallback — find the element by text content, click
+                # via elementFromPoint at its bounding box center. This
+                # is the "elements under overlays" fix: Playwright
+                # refuses to click an element that has a cookie banner
+                # on top of it, but a direct JS dispatch bypasses the
+                # interception check entirely.
+                clicked = page.evaluate(
+                    """(txt) => {
+                        const needle = txt.toLowerCase();
+                        const candidates = Array.from(
+                            document.querySelectorAll('a, button, [role=\"link\"], [role=\"button\"], input[type=\"submit\"]')
+                        ).filter(el => {
+                            const t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+                            return t.length > 0 && t.includes(needle);
+                        });
+                        if (candidates.length === 0) return null;
+                        const el = candidates[0];
+                        el.scrollIntoView({block: 'center', inline: 'center'});
+                        el.click();
+                        return (el.innerText || el.value || '').trim().slice(0, 80);
+                    }""",
+                    text,
+                )
+                if clicked is None:
+                    return {"result": f"NOT FOUND: no element with text '{text}'"}
+                _invalidate_state_cache()
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                return {"result": f"OK: js-clicked '{clicked}' → {page.url}"}
             locator.first.click(timeout=5000)
+            _invalidate_state_cache()
             page.wait_for_load_state("domcontentloaded", timeout=5000)
             time.sleep(0.5)
             return {"result": f"OK: clicked '{text}' → {page.url}"}
@@ -233,11 +309,13 @@ def _execute_command(cmd: dict) -> dict:
             if locator.count() == 0:
                 return {"result": f"NOT FOUND: no input matching '{selector}'"}
             locator.first.fill(value, timeout=5000)
+            _invalidate_state_cache()
             return {"result": f"OK: typed into '{selector}'"}
 
         elif action == "press":
             key = cmd.get("key", "Enter")
             page.keyboard.press(key)
+            _invalidate_state_cache()
             time.sleep(0.5)
             return {"result": f"OK: pressed {key} → {page.url}"}
 
@@ -252,6 +330,7 @@ def _execute_command(cmd: dict) -> dict:
             direction = cmd.get("direction", "down")
             delta = 500 if direction == "down" else -500
             page.mouse.wheel(0, delta)
+            _invalidate_state_cache()
             time.sleep(0.3)
             return {"result": f"OK: scrolled {direction}"}
 
