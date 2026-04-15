@@ -690,10 +690,37 @@ def _speak_ack(action: str) -> None:
 # =============================================================================
 
 TRIGGER_TOKENS: set[str] = {"nexus", "jarvis"}
+
+# STT-tolerant substring forms. Gemini Live's input transcription
+# occasionally mangles the opening trigger word — seen in the wild
+# as "I request Hey, can you browse..." for what was clearly
+# "hey jarvis, can you browse...". "jarv" and "nexu" are rare
+# enough in English that false positives are effectively zero (no
+# common word starts with either), so expanding the substring set
+# costs nothing and catches the partial-transcription cases.
+_TRIGGER_FUZZY: tuple[str, ...] = (
+    "jarvis", "jarv", "nexus", "nexu",
+)
+
 ACTION_GATE: set[str] = {
     "browse", "search", "navigate", "documents", "window", "code", "connect",
     "briefing", "calendar", "email", "reminders", "github",
 }
+
+# Stateful trust window (Finding #1 from plan2_baseline.md).
+#
+# After any successful gated tool call, the next _GATE_TRUST_WINDOW_S
+# seconds of turns bypass the trigger-word check. Real conversations
+# don't repeat the wake word on every follow-up — "jarvis put chrome
+# on the left" is naturally followed by "and safari on the right"
+# without re-saying "jarvis". The strict gate breaks that flow and
+# was the single biggest failure cluster in the Plan 2 baseline.
+#
+# Reset at the start of each Gemini session so a fresh launch always
+# requires an explicit trigger on the first call (no accidental
+# ambient-trigger from a previous run).
+_GATE_TRUST_WINDOW_S = 60.0
+_last_gate_pass_ts: float = 0.0
 
 
 def _transcript_has_trigger(transcript: str) -> bool:
@@ -701,7 +728,20 @@ def _transcript_has_trigger(transcript: str) -> bool:
     if not transcript:
         return False
     t = transcript.lower()
-    return any(tok in t for tok in TRIGGER_TOKENS)
+    return any(tok in t for tok in _TRIGGER_FUZZY)
+
+
+def _gate_in_trust_window() -> bool:
+    """True if we're within the post-successful-call trust window."""
+    if _last_gate_pass_ts <= 0.0:
+        return False
+    return (time.monotonic() - _last_gate_pass_ts) < _GATE_TRUST_WINDOW_S
+
+
+def _mark_gate_pass() -> None:
+    """Called after an allowed gated tool call — opens the trust window."""
+    global _last_gate_pass_ts
+    _last_gate_pass_ts = time.monotonic()
 
 
 def _kill_active_tts() -> None:
@@ -815,6 +855,11 @@ async def main():
             _handoff["project"] = None
             _handoff["session"] = None
             _handoff["path"] = None
+            # Fresh session starts with a closed trust window —
+            # the first gated call of the day must carry a real
+            # trigger. Prevents ambient-trigger from a previous run.
+            global _last_gate_pass_ts
+            _last_gate_pass_ts = 0.0
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
                           input=True, frames_per_buffer=CHUNK)
@@ -879,17 +924,24 @@ async def main():
                                         query = args.get("query", "")
                                         sess_choice = args.get("session", "")
 
-                                        # Phase 1E — trigger-word gate.
-                                        # Block gated actions when the
+                                        # Trigger-word gate with a
+                                        # trust window. Block gated
+                                        # actions ONLY when the
                                         # transcript has no trigger
-                                        # token. Fall-open on empty
-                                        # transcript (prefer missing a
-                                        # block over blocking a real
-                                        # call).
+                                        # AND we're outside the post-
+                                        # successful-call trust
+                                        # window. Fall-open on empty
+                                        # transcript.
                                         action_lc = action.lower().strip()
                                         gated = action_lc in ACTION_GATE
                                         has_trigger = _transcript_has_trigger(transcript_snapshot)
-                                        if gated and transcript_snapshot and not has_trigger:
+                                        in_trust = _gate_in_trust_window()
+                                        if (
+                                            gated
+                                            and transcript_snapshot
+                                            and not has_trigger
+                                            and not in_trust
+                                        ):
                                             logger.warning(
                                                 f"gate blocked action={action_lc!r} "
                                                 f"transcript={transcript_snapshot!r}"
@@ -911,6 +963,18 @@ async def main():
                                                 )]
                                             )
                                             continue
+
+                                        # Gate passed — open/extend
+                                        # the trust window so the next
+                                        # minute of follow-up turns
+                                        # doesn't need another trigger.
+                                        if gated:
+                                            _mark_gate_pass()
+                                            if in_trust and not has_trigger:
+                                                logger.info(
+                                                    f"gate trust-window allowed {action_lc!r} "
+                                                    f"(transcript={transcript_snapshot!r})"
+                                                )
 
                                         result, is_long = await asyncio.to_thread(
                                             handle_tool, action, query, sess_choice
