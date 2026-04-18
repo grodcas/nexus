@@ -91,10 +91,10 @@ def score_task_success(case: dict, result: dict, judge=None) -> bool:
     mode = success.get("mode", "exact")
 
     if mode == "no_tool":
-        # Passes if either (a) no tool was called, or (b) the gate
-        # blocked the call (which means slim recognised the case as
-        # trigger-less and did the right thing).
-        return result.get("tool_called") is None or bool(result.get("gate_blocked"))
+        # Passes if no tool was called. (The trigger-word gate used to
+        # count as a pass too, but it's been removed — routing is now
+        # handled entirely by the model's content-based decision.)
+        return result.get("tool_called") is None
 
     if mode == "contains":
         predicate = (success.get("predicate") or "").lower()
@@ -170,7 +170,6 @@ def _test() -> None:
             "tool_args": {},
             "assistant_text": "",
             "handler_result": "",
-            "gate_blocked": False,
             "latency_ms": 100.0,
         }
         base.update(k)
@@ -240,11 +239,10 @@ def _test() -> None:
           _mk_result(latency_ms=1500),
           {"routing": True, "task_success": True, "latency": False})
 
-    # 9. no_tool / gate blocked
-    check("no_tool / gate blocked (also passes)",
-          _mk_case(),
-          _mk_result(tool_called="do", tool_args={"action": "search"}, gate_blocked=True),
-          {"routing": False, "task_success": True, "latency": True})
+    # (Previously: "no_tool / gate blocked also passes" — the gate
+    # has been removed, so a tool call in a no_tool case is now a
+    # plain failure, which the "no_tool / tool called" case above
+    # already covers.)
 
     # 10. session arg match
     check("session arg match",

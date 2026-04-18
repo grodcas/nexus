@@ -8,6 +8,7 @@ Long tool results bypass Gemini and go straight to TTS.
 """
 
 import asyncio
+import faulthandler
 import json
 import os
 import re
@@ -15,6 +16,12 @@ import subprocess
 import sys
 import threading
 import time
+
+# Native-crash diagnostics. When a segfault hits (faster-whisper,
+# pyaudio stream close, Playwright daemon thread at shutdown), this
+# dumps a Python-level stack trace to stderr before the process dies —
+# otherwise we just see "zsh: segmentation fault" with no context.
+faulthandler.enable()
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
@@ -60,7 +67,7 @@ BROWSE_RESULT_LIMIT = 800
 # System prompt — under 300 chars
 # =============================================================================
 
-SYSTEM_PROMPT = "Be brief. Answer from your own knowledge first. Use the do tool only when the request needs an action."
+SYSTEM_PROMPT = "Answer from your own knowledge. No follow-ups. Use do tool for actions."
 
 # =============================================================================
 # Tool declarations — minimal
@@ -76,19 +83,20 @@ TOOL_DECLARATIONS = [
                 "action": types.Schema(
                     type=types.Type.STRING,
                     description=(
-                        "search: web. documents: my files. browse: open site. "
-                        "sleep: 'sleep' / 'goodbye' / 'bye'. "
-                        "calendar, email, reminders, briefing, window, code, github."
+                        "One of: search, documents, browse, calendar, email, "
+                        "reminders, briefing, window, code, github, sleep. "
+                        "search=web, documents=user's files, browse=open site, "
+                        "sleep='sleep'/'goodbye'/'bye'."
                     ),
                 ),
                 "query": types.Schema(
                     type=types.Type.STRING,
                     description=(
-                        "Details in user's words. For code: project name "
-                        f"(one of: {', '.join(PROJECTS.keys())}). "
-                        "For window: a verb-led command like 'move chrome left', "
-                        "'move chrome to other screen', 'move chrome left on secondary screen', "
-                        "'maximize iterm on main', 'close finder', 'list'."
+                        "User's words. "
+                        "For documents: keywords only, not a sentence. "
+                        f"For code: project name (one of: {', '.join(PROJECTS.keys())}). "
+                        "For window: a verb-led command "
+                        "('move chrome left', 'maximize iterm', 'close finder', 'list')."
                     ),
                 ),
                 "session": types.Schema(
@@ -245,10 +253,23 @@ def _read_file(path):
 
 
 def _search_worktree(query):
+    """
+    Rank the worktree's markdown index files by how many query
+    keywords they contain, then return the top hits with their
+    nearest heading + best-matching line.
+
+    The worktree is an index — each .md is prose describing groups
+    of files on OneDrive (a year of coursework, a project's code
+    layout, etc.). Line-level exact-match misses badly on compound
+    queries like "PID automation control" because no single line
+    has every word. File-level scoring with ANY-word matching finds
+    the right subject area even when keywords are scattered.
+    """
     words = [w.lower() for w in query.split() if len(w) > 2]
     if not words:
         return "No results."
-    results = []
+
+    scored: list[tuple[int, int, str, str, str]] = []  # (file_hits, line_hits, rel, heading, snippet)
     files_scanned = 0
     with timed("documents.walk_scan", query_len=len(query)):
         for dirpath, _, filenames in os.walk(WORKTREE_ROOT):
@@ -257,15 +278,55 @@ def _search_worktree(query):
                     continue
                 fpath = os.path.join(dirpath, fname)
                 files_scanned += 1
-                with open(fpath) as f:
-                    for line in f:
-                        if all(w in line.lower() for w in words):
-                            results.append(f"[{fname}] {line.strip()}")
-                if len(results) >= 10:
-                    break
-    log_event(phase="documents.scan_summary", files_scanned=files_scanned,
-              hits=len(results))
-    return "\n".join(results) if results else "Nothing found."
+                try:
+                    with open(fpath) as f:
+                        content = f.read()
+                except Exception:
+                    continue
+                lc = content.lower()
+                file_hits = sum(1 for w in words if w in lc)
+                if file_hits == 0:
+                    continue
+
+                # Walk for the heading nearest the best-matching line.
+                cur_heading = ""
+                best_heading = ""
+                best_line = ""
+                best_line_hits = 0
+                for line in content.split("\n"):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        cur_heading = stripped.lstrip("#").strip()
+                        continue
+                    if not stripped:
+                        continue
+                    ll = stripped.lower()
+                    lh = sum(1 for w in words if w in ll)
+                    if lh > best_line_hits:
+                        best_line_hits = lh
+                        best_line = stripped
+                        best_heading = cur_heading
+
+                rel = os.path.relpath(fpath, WORKTREE_ROOT)
+                scored.append((file_hits, best_line_hits, rel, best_heading, best_line))
+
+    # Sort: distinct keywords in file first, then best-line score, then path.
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    log_event(phase="documents.scan_summary",
+              files_scanned=files_scanned, hits=len(scored))
+    if not scored:
+        return "No results."
+
+    # Top 3. Each line: `path > Heading — snippet`. Keeps things
+    # short enough for Gemini to relay in 1-3 spoken sentences.
+    lines = [f"{len(scored)} files matched '{query}':"]
+    for file_hits, _line_hits, rel, heading, snippet in scored[:3]:
+        head_str = f" > {heading}" if heading else ""
+        lines.append(
+            f"- {rel}{head_str} ({file_hits}/{len(words)} keywords): "
+            f"{snippet[:180]}"
+        )
+    return "\n".join(lines)
 
 
 BROWSE_TIMEOUT_SEC = 45  # hard cap on the inner Claude nav agent
@@ -588,9 +649,24 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
 
         elif action == "documents":
             result = _search_worktree(query)
-            if len(result) > SHORT_RESULT_LIMIT:
-                return result, True
-            return result, False
+            if result == "No results.":
+                return (
+                    f"No matches in the worktree for '{query}'. "
+                    "Tell the user nothing matched and suggest "
+                    "they try different keywords."
+                ), False
+            # Frame so Gemini relays it as natural speech instead
+            # of reading paths/scores verbatim. Same pattern as browse.
+            framed = (
+                f"Files in the worktree matching '{query}':\n\n"
+                f"{result}\n\n"
+                "Relay to the user in 1-3 natural spoken sentences: "
+                "name the best-matching file and the heading it was "
+                "found under (so the user knows where to look). "
+                "Mention 1-2 runners-up if they're also relevant. "
+                "Do not read out raw paths or scores."
+            )
+            return framed, False
 
         elif action in ("code", "connect"):
             project = (query or "").lower().strip()
@@ -701,8 +777,21 @@ _MIC_GATE_ENABLED = os.environ.get("NEXUS_MIC_GATE", "1").lower() not in ("0", "
 try:
     _MIC_GATE_TAIL_S = float(os.environ.get("NEXUS_MIC_GATE_TAIL_MS", "400")) / 1000.0
 except ValueError:
-    _MIC_GATE_TAIL_S = 0.4
+    _MIC_GATE_TAIL_S = 1.0
 _last_gemini_audio_ts: float = 0.0
+
+# Hard speaking flag — set True the moment Gemini starts emitting a
+# response (either audio chunks arriving OR we just sent a tool
+# response and are waiting for the reply), cleared on turn_complete.
+# This covers the gap where the timestamp-tail alone fails: between
+# intra-sentence pauses (Gemini waits 500ms+ between phrases) and
+# between send_tool_response and Gemini's first audio chunk. Without
+# this flag the mic briefly opens and picks up the speaker output,
+# which the model then treats as a new user question — observed in
+# the wild as 3 successive self-triggered searches from one user
+# prompt. The tail stays too, as the speaker's own buffer drain
+# outlives turn_complete by ~100-300 ms.
+_gemini_speaking: bool = False
 
 # Tool-in-flight gate.
 #
@@ -719,6 +808,43 @@ _last_gemini_audio_ts: float = 0.0
 # alive without feeding the server real audio it isn't expecting.
 _tool_in_flight: bool = False
 
+# Graceful session rotation.
+#
+# Gemini Live audio-only sessions are capped at 15 minutes. The server
+# sends a GoAway message with `time_left` before force-closing; if the
+# client ignores it, the server terminates with a 1008 policy violation.
+#
+# Strategy: rotate proactively once the session passes
+# _SESSION_ROTATE_AFTER_S (80% of the cap). Rotation only fires on a
+# `turn_complete` boundary — Gemini has finished speaking and the user
+# hasn't started yet, so the cut is silent from the user's side. The
+# new session is opened with the last `session_resumption_update.new_handle`
+# so state persists across the boundary.
+_SESSION_MAX_S: float = 15 * 60     # Gemini Live audio-only cap
+_SESSION_ROTATE_AFTER_S: float = 12 * 60  # 80% — leaves headroom before GoAway
+_session_started_at: float = 0.0
+_session_handle: str | None = None
+_rotate_requested: bool = False
+
+
+def _is_transient_close(e: Exception) -> bool:
+    """
+    True if `e` represents a recoverable Live session close that
+    should trigger a silent reconnect rather than a process exit.
+
+    Covers:
+      - APIError 1011 (random server internal)
+      - APIError 1008 (policy violation from missed GoAway)
+      - websockets.exceptions.ConnectionClosedError / ConnectionClosedOK
+      - any `ConnectionClosed*` class by name (version-agnostic)
+    """
+    msg = str(e)
+    if "1011" in msg or "1008" in msg:
+        return True
+    if "ConnectionClosed" in type(e).__name__:
+        return True
+    return False
+
 
 def _mic_should_be_muted() -> bool:
     """
@@ -731,10 +857,13 @@ def _mic_should_be_muted() -> bool:
     if _ACTIVE_TTS is not None and _ACTIVE_TTS.poll() is None:
         return True
     # A tool is running — documented pattern is "execution pauses."
-    # Keep the session warm with silence; no real mic.
     if _tool_in_flight:
         return True
-    # Within tail window after Gemini's last audio chunk → mute.
+    # Gemini currently has the floor — speaking or about to.
+    if _gemini_speaking:
+        return True
+    # Tail after Gemini's last audio chunk — covers speaker buffer
+    # drain and brief intra-turn pauses that sneak past the flag.
     if _last_gemini_audio_ts > 0.0:
         if (time.monotonic() - _last_gemini_audio_ts) < _MIC_GATE_TAIL_S:
             return True
@@ -826,83 +955,19 @@ def _speak_ack(action: str) -> None:
 
 
 # =============================================================================
-# Phase 1E — Trigger-word hard gate
-#
-# Gemini Live sometimes decides to call a tool just because "the
-# context sounds operational," even when the user said nothing that
-# should have triggered an action. Prompt edits alone cannot fix this
-# reliably (the JARVIS_GUIDE anti-patterns document at least four
-# times we tried). The structural fix is to enable input audio
-# transcription on the Live session, accumulate the user's current
-# turn transcript in a rolling buffer, and — before dispatching any
-# gated tool_call — confirm the buffer contains a trigger token.
-#
-# If the transcript is empty (e.g. the tool_call arrived before the
-# transcription did), the gate falls OPEN: we'd rather miss a block
-# than block a legitimate call. Quantify the rate later in Plan 2.
-#
-# `sleep` is explicitly ungated so "go to sleep" still works without
-# saying a trigger word. Conversational answers (no tool call at all)
-# are never touched by the gate — it only intercepts dispatch.
-# =============================================================================
-
-# =============================================================================
-# Trigger words — two separate sets for two separate jobs
+# Wake phrase — only used by the sleep-mode listener
 # =============================================================================
 #
-# COMMAND TRIGGER (the agent's "name")
-#   Used by the trigger-word gate in active mode. Every first-turn
-#   tool call must have this in the transcript. The trust window
-#   then carries the next ~60s of follow-ups without needing it.
+# When jarvis is sleeping, a local faster-whisper loop transcribes mic
+# audio and watches for any of these phrases to reopen the Gemini Live
+# session. Multi-word phrases ("wake up") transcribe far more reliably
+# under real-world mic conditions than single proper nouns — Whisper
+# small routinely mangles single-word wake words.
 #
-# WAKE PHRASE (only to leave sleep mode)
-#   Used by the local wake-word listener when Nexus is sleeping.
-#   Ignored by the active-mode gate. Meant to be something you'd
-#   naturally say to a sleeping agent and that Whisper transcribes
-#   reliably (multi-word phrases are best — see below).
-#
-# Lessons from the live iterations:
-#
-#   - Single proper-noun wake words ("jarvis", "atlas") are
-#     unreliable in Gemini Live STT and Whisper small. Both
-#     mangle or drop them under real-world mic conditions.
-#   - Common English words — especially real words that happen to
-#     make sense as names — are dramatically more robust because
-#     they're over-represented in STT training data.
-#   - Multi-word phrases are even more robust because STT models
-#     are trained on phrase-level n-grams. "wake up" as the sleep
-#     phrase transcribes ~100% of the time.
-#
-# Default command trigger: "friday"
-#   Real English word (day of the week → top-100 frequency).
-#   Sharp consonants (Fr-, -day), natural to say as an address,
-#   pop-culture safe ("Friday, search for X"), and not a substring
-#   of any common word.
-#
-# Default wake phrase: "wake up"
-#   Semantically literal ("wake the sleeping agent"), both words
-#   top-100 English, rare as a standalone utterance at a desk.
-#
-# Overrides via .env:
-#   NEXUS_COMMAND_TRIGGERS="friday"       # comma-separated, active-mode
-#   NEXUS_WAKE_PHRASES="wake up"          # comma-separated, sleep-mode
-#
-# Back-compat: NEXUS_TRIGGER_WORDS (from the earlier "one trigger
-# for everything" attempt) still works — if set, it populates the
-# command-trigger list as before. New installs should use the new
-# vars.
-#
-# Good alternatives for command trigger:
-#   "computer"  — Star-Trek classic, single word, 3 syllables
-#   "morgan"    — real name, 2 syllables, very STT-reliable
-#   "sage"      — short, distinctive, uncommon at desk
-#   "sonny"     — proper name from pop culture, clear phonemes
-#
-# Bad:
-#   "echo"      — too common, false positives everywhere
-#   "halo"      — substring of "hall"
-#   "nex"       — matches "next"
-#   "max"       — too short, ambiguous
+# Override via NEXUS_WAKE_PHRASES="phrase,another" in .env. No active-
+# mode gate: the C21 action schema + 3.1 model route tool calls at
+# ~100% on content alone, so there's nothing for a transcript-based
+# gate to add.
 
 def _parse_trigger_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     raw = os.environ.get(name, "").strip()
@@ -911,84 +976,20 @@ def _parse_trigger_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(t.strip().lower() for t in raw.split(",") if t.strip())
 
 
-# Command triggers — active mode gate.
-_COMMAND_TRIGGERS: tuple[str, ...] = _parse_trigger_env(
-    "NEXUS_COMMAND_TRIGGERS",
-    _parse_trigger_env("NEXUS_TRIGGER_WORDS", ("honey",)),  # back-compat
-)
-
-# Wake phrases — sleep mode listener only.
 _WAKE_TRIGGERS: tuple[str, ...] = _parse_trigger_env(
     "NEXUS_WAKE_PHRASES", ("wake up",)
 )
 
-# Kept for back-compat with score.py / eval imports. Points at the
-# active-mode set, which is what the gate uses.
-_TRIGGER_FUZZY: tuple[str, ...] = _COMMAND_TRIGGERS
-TRIGGER_TOKENS: set[str] = set(_COMMAND_TRIGGERS)
-
-ACTION_GATE: set[str] = {
-    # Only the cost-expensive / session-changing actions stay gated.
-    # Reads (calendar, email, briefing, reminders, documents, github)
-    # and reversible actions (search, browse, window, navigate) flow
-    # freely — Gemini routes them at 100% on the C21 schema battery,
-    # and a spurious read is cheap. The "least me the windows"
-    # homophone failure mode goes away with `window` ungated.
-    "code", "connect", "sleep",
-}
-
-# Stateful trust window (Finding #1 from plan2_baseline.md).
-#
-# After any successful gated tool call, the next _GATE_TRUST_WINDOW_S
-# seconds of turns bypass the trigger-word check. Real conversations
-# don't repeat the wake word on every follow-up — "jarvis put chrome
-# on the left" is naturally followed by "and safari on the right"
-# without re-saying "jarvis". The strict gate breaks that flow and
-# was the single biggest failure cluster in the Plan 2 baseline.
-#
-# Reset at the start of each Gemini session so a fresh launch always
-# requires an explicit trigger on the first call (no accidental
-# ambient-trigger from a previous run).
-_GATE_TRUST_WINDOW_S = 60.0
-_last_gate_pass_ts: float = 0.0
-
 
 def _transcript_has_trigger(
     transcript: str,
-    tokens: tuple[str, ...] = _COMMAND_TRIGGERS,
+    tokens: tuple[str, ...] = _WAKE_TRIGGERS,
 ) -> bool:
-    """
-    Word-boundary check for any of the given trigger tokens,
-    case-insensitive.
-
-    Word boundaries matter once you pick a common English word
-    as a trigger — plain substring would have "honey" match
-    "honeymoon"/"honeybee"/"honeycomb". We compile a regex
-    that requires \\b on each side of every token so the
-    trigger must appear as its own word (or phrase, for
-    multi-word tokens like "wake up").
-
-    Defaults to the active-mode command triggers; the sleep
-    listener passes _WAKE_TRIGGERS explicitly.
-    """
+    """Case-insensitive word-boundary match for any of `tokens`."""
     if not transcript or not tokens:
         return False
-    # Build the regex lazily-per-call. Small enough to not cache.
     pattern = r"\b(?:" + "|".join(re.escape(t) for t in tokens) + r")\b"
     return re.search(pattern, transcript, re.IGNORECASE) is not None
-
-
-def _gate_in_trust_window() -> bool:
-    """True if we're within the post-successful-call trust window."""
-    if _last_gate_pass_ts <= 0.0:
-        return False
-    return (time.monotonic() - _last_gate_pass_ts) < _GATE_TRUST_WINDOW_S
-
-
-def _mark_gate_pass() -> None:
-    """Called after an allowed gated tool call — opens the trust window."""
-    global _last_gate_pass_ts
-    _last_gate_pass_ts = time.monotonic()
 
 
 # =============================================================================
@@ -1418,7 +1419,7 @@ async def main():
     # broken cell. _sleep_requested was silently falling out of scope
     # before this line was added, which is why sleep mode looked
     # "exactly like before" — the main loop never saw the flag flip.
-    global _MAIN_LOOP, _sleep_requested, _last_gate_pass_ts, _last_gemini_audio_ts
+    global _MAIN_LOOP, _sleep_requested, _last_gemini_audio_ts
     _MAIN_LOOP = asyncio.get_running_loop()  # used by _maybe_sync's background scheduler
 
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -1448,6 +1449,18 @@ async def main():
                 logger.warning(f"Cloud TTS pre-warm failed (will fall back to say): {e}")
         asyncio.create_task(_prewarm_cloud_tts())
 
+    # Pre-warm faster-whisper so the sleep→wake path doesn't do a
+    # cold native-model load right when pyaudio is tearing down. The
+    # cold load was a likely contributor to segfaults on sleep.
+    async def _prewarm_whisper():
+        try:
+            from audio import get_whisper
+            await asyncio.to_thread(get_whisper)
+            logger.info("Whisper pre-warmed")
+        except Exception as e:
+            logger.warning(f"Whisper pre-warm failed: {e}")
+    asyncio.create_task(_prewarm_whisper())
+
     config = types.LiveConnectConfig(
         system_instruction=SYSTEM_PROMPT,
         response_modalities=["AUDIO"],
@@ -1457,9 +1470,17 @@ async def main():
             )
         ),
         tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
-        # Phase 1E — enable input transcription so we can gate tool
-        # dispatch on trigger-word presence in the user's utterance.
-        input_audio_transcription=types.AudioTranscriptionConfig(),
+        # Session resumption — server sends handle tokens we can pass
+        # on reconnect to continue the same logical conversation. Used
+        # by the graceful rotation path so the user doesn't notice
+        # when we proactively rotate before the 15-min session cap.
+        session_resumption=types.SessionResumptionConfig(),
+        # NB: ProactivityConfig(proactive_audio=True) would be ideal
+        # for the "stay silent" behavior, but the Gemini Developer
+        # API rejects that setup field ("Unknown name 'proactivity'
+        # at 'setup': Cannot find field") even though the SDK types
+        # accept it — it's Vertex-only for now. The system prompt
+        # carries the full "no follow-ups" instruction instead.
     )
 
     pa = pyaudio.PyAudio()
@@ -1476,10 +1497,12 @@ async def main():
             _handoff["project"] = None
             _handoff["session"] = None
             _handoff["path"] = None
-            _last_gate_pass_ts = 0.0
             _last_gemini_audio_ts = 0.0  # mic gate starts open
-            global _tool_in_flight
+            global _tool_in_flight, _session_started_at, _rotate_requested, _session_handle, _gemini_speaking
             _tool_in_flight = False  # no stale tool gate on new session
+            _session_started_at = time.monotonic()
+            _rotate_requested = False
+            _gemini_speaking = False  # no stale speaking flag across sessions
             _kill_active_tts()  # no leftover say/afplay from prior run
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
@@ -1487,9 +1510,23 @@ async def main():
             spk = pa.open(format=pyaudio.paInt16, channels=1, rate=RECV_RATE,
                           output=True, frames_per_buffer=4096)
 
-            # Set by the 1011-detection block below; triggers a silent
-            # reconnect via `continue` in the outer while loop.
-            reconnect_on_1011 = False
+            # Set by the close-detection block below (1011, 1008,
+            # GoAway, or proactive rotation). Triggers a silent
+            # reopen via `continue` in the outer while loop.
+            reconnect_requested = False
+
+            # Per-session config: reuse the last resumption handle if
+            # we have one (transparent reopen after rotation/GoAway).
+            # First launch has handle=None → server treats it as a
+            # fresh session.
+            if _session_handle:
+                session_config = config.model_copy(update={
+                    "session_resumption": types.SessionResumptionConfig(
+                        handle=_session_handle,
+                    ),
+                })
+            else:
+                session_config = config
 
             try:
                 async with client.aio.live.connect(
@@ -1499,7 +1536,7 @@ async def main():
                     # proper function-calling support, known-stable
                     # for production Live API usage.
                     model="gemini-3.1-flash-live-preview",
-                    config=config,
+                    config=session_config,
                 ) as session:
 
                     async def send_audio():
@@ -1521,15 +1558,16 @@ async def main():
                                 audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                             )
 
-                    # Phase 1E — rolling transcript buffer for the
-                    # current user turn. Reset whenever the turn ends.
-                    current_transcript = [""]
-
                     async def receive():
-                        global _last_gemini_audio_ts
+                        global _last_gemini_audio_ts, _session_handle, _rotate_requested, _gemini_speaking
                         while True:
                             async for msg in session.receive():
                                 if msg.data:
+                                    # Gemini has the floor — hard-mute
+                                    # the outbound mic until turn_complete
+                                    # so the speaker's own output can't
+                                    # feed back as a new user query.
+                                    _gemini_speaking = True
                                     # Mute Gemini's audio while a local
                                     # TTS bypass is in progress. Without
                                     # this, Gemini's response to the
@@ -1542,88 +1580,84 @@ async def main():
                                         spk.write(msg.data)
                                         # Mark the moment Gemini put
                                         # audio through the speaker so
-                                        # the mic gate can suppress
-                                        # outbound input during and
-                                        # just after the utterance.
+                                        # the mic gate's tail can keep
+                                        # it muted after the last chunk.
                                         _last_gemini_audio_ts = time.monotonic()
 
-                                # Accumulate user-side transcription.
+                                # Documented barge-in pattern: server
+                                # sends server_content.interrupted=True
+                                # when the user speaks mid-reply. We
+                                # stop treating Gemini as "on the floor"
+                                # immediately so the mic opens for the
+                                # user's continued speech, and we drop
+                                # any pending Gemini audio we haven't
+                                # played yet (anything already in the
+                                # OS output buffer will drain naturally
+                                # — pyaudio doesn't expose a flush).
+                                sc_early = getattr(msg, "server_content", None)
+                                if sc_early is not None and getattr(sc_early, "interrupted", False):
+                                    if _gemini_speaking:
+                                        logger.info("server: interrupted — releasing floor")
+                                    _gemini_speaking = False
+                                    _last_gemini_audio_ts = 0.0
+
+                                # Graceful rotation — capture resumption
+                                # handles so we can reopen a new session
+                                # with preserved state, and honor the
+                                # server's GoAway warning.
+                                sru = getattr(msg, "session_resumption_update", None)
+                                if sru is not None and getattr(sru, "resumable", False):
+                                    h = getattr(sru, "new_handle", None)
+                                    if h:
+                                        _session_handle = h
+
+                                ga = getattr(msg, "go_away", None)
+                                if ga is not None:
+                                    tl = getattr(ga, "time_left", "?")
+                                    logger.info(
+                                        f"Server GoAway (time_left={tl}) — rotating"
+                                    )
+                                    _rotate_requested = True
+
+                                # Proactive rotation at turn boundaries
+                                # once we're past the rotate threshold.
+                                # Waiting for turn_complete keeps the
+                                # cut invisible — Gemini has finished
+                                # speaking, user hasn't started yet.
                                 sc = getattr(msg, "server_content", None)
-                                if sc is not None:
-                                    inp = getattr(sc, "input_transcription", None)
-                                    if inp is not None and getattr(inp, "text", None):
-                                        current_transcript[0] += inp.text
-                                    if getattr(sc, "turn_complete", False):
-                                        # Turn done — reset buffer for the next one.
-                                        current_transcript[0] = ""
+                                if sc is not None and getattr(sc, "turn_complete", False):
+                                    # Gemini done — release the hard
+                                    # speaking flag and bump the tail ts
+                                    # so the tail timer starts NOW (from
+                                    # turn_complete, not from the last
+                                    # audio chunk which may be ~hundreds
+                                    # of ms earlier). Covers the speaker
+                                    # buffer drain cleanly.
+                                    _gemini_speaking = False
+                                    _last_gemini_audio_ts = time.monotonic()
+                                    age = time.monotonic() - _session_started_at
+                                    if age > _SESSION_ROTATE_AFTER_S:
+                                        logger.info(
+                                            f"Proactive rotation at {age:.0f}s "
+                                            f"(> {_SESSION_ROTATE_AFTER_S}s threshold)"
+                                        )
+                                        _rotate_requested = True
+                                    if _rotate_requested:
+                                        return
 
                                 if msg.tool_call:
-                                    # Phase 1G — a new tool call
-                                    # supersedes any in-flight long TTS
-                                    # (e.g. user interrupts a briefing
-                                    # mid-read with "never mind, search
-                                    # for X").
+                                    # A new tool call supersedes any
+                                    # in-flight long TTS (user interrupting
+                                    # a briefing mid-read with "never
+                                    # mind, search for X").
                                     _kill_active_tts()
-                                    transcript_snapshot = current_transcript[0]
                                     for fc in msg.tool_call.function_calls:
                                         logger.info(f"Tool call: {fc.name}({dict(fc.args)})")
                                         args = dict(fc.args) if fc.args else {}
                                         action = args.get("action", "")
                                         query = args.get("query", "")
                                         sess_choice = args.get("session", "")
-
-                                        # Trigger-word gate with a
-                                        # trust window. Block gated
-                                        # actions ONLY when the
-                                        # transcript has no trigger
-                                        # AND we're outside the post-
-                                        # successful-call trust
-                                        # window. Fall-open on empty
-                                        # transcript.
                                         action_lc = action.lower().strip()
-                                        gated = action_lc in ACTION_GATE
-                                        has_trigger = _transcript_has_trigger(transcript_snapshot)
-                                        in_trust = _gate_in_trust_window()
-                                        if (
-                                            gated
-                                            and transcript_snapshot
-                                            and not has_trigger
-                                            and not in_trust
-                                        ):
-                                            logger.warning(
-                                                f"gate blocked action={action_lc!r} "
-                                                f"transcript={transcript_snapshot!r}"
-                                            )
-                                            log_event(
-                                                phase="gate.blocked",
-                                                action=action_lc,
-                                                transcript_len=len(transcript_snapshot),
-                                            )
-                                            trigger_names = ", ".join(sorted(_COMMAND_TRIGGERS))
-                                            gemini_result = (
-                                                f"No trigger word heard. "
-                                                f"Say {trigger_names} first."
-                                            )
-                                            await session.send_tool_response(
-                                                function_responses=[types.FunctionResponse(
-                                                    name=fc.name,
-                                                    id=fc.id,
-                                                    response={"result": gemini_result},
-                                                )]
-                                            )
-                                            continue
-
-                                        # Gate passed — open/extend
-                                        # the trust window so the next
-                                        # minute of follow-up turns
-                                        # doesn't need another trigger.
-                                        if gated:
-                                            _mark_gate_pass()
-                                            if in_trust and not has_trigger:
-                                                logger.info(
-                                                    f"gate trust-window allowed {action_lc!r} "
-                                                    f"(transcript={transcript_snapshot!r})"
-                                                )
 
                                         # Pause outbound mic for the full
                                         # tool-dispatch-to-response window.
@@ -1730,36 +1764,52 @@ async def main():
                             except (asyncio.CancelledError, KeyboardInterrupt):
                                 raise
                             except Exception as e:
-                                msg = str(e)
-                                if "1011" in msg or "ConnectionClosed" in type(e).__name__:
+                                if _is_transient_close(e):
                                     logger.warning(
-                                        f"Live session closed with 1011 "
-                                        f"({type(e).__name__}): {msg[:120]} — reconnecting"
+                                        f"Live session closed ({type(e).__name__}): "
+                                        f"{str(e)[:160]} — reconnecting"
                                     )
-                                    reconnect_on_1011 = True
+                                    reconnect_requested = True
                                 else:
                                     logger.error(
-                                        f"session task exception ({type(e).__name__}): {msg[:200]}"
+                                        f"session task exception ({type(e).__name__}): "
+                                        f"{str(e)[:200]}"
                                     )
                     except (KeyboardInterrupt, asyncio.CancelledError):
                         send_task.cancel()
                         recv_task.cancel()
+
+                # Clean rotation — receive() returned without exception
+                # because _rotate_requested was set on a turn boundary
+                # or GoAway. Same downstream handling as a transient.
+                if _rotate_requested:
+                    reconnect_requested = True
             except Exception as e:
                 # `async with client.aio.live.connect(...)` itself can
                 # raise on the way in or on clean exit if the socket
-                # closed mid-handshake. Treat 1011 the same as above.
-                msg = str(e)
-                if "1011" in msg or "ConnectionClosed" in type(e).__name__:
+                # closed mid-handshake.
+                if _is_transient_close(e):
                     logger.warning(
-                        f"Live connect closed with 1011 "
-                        f"({type(e).__name__}): {msg[:120]} — reconnecting"
+                        f"Live connect closed ({type(e).__name__}): "
+                        f"{str(e)[:160]} — reconnecting"
                     )
-                    reconnect_on_1011 = True
+                    reconnect_requested = True
                 else:
                     raise
             finally:
-                mic.close()
-                spk.close()
+                # Kill any local TTS FIRST — stops audio subprocesses
+                # holding native resources before we close pyaudio
+                # streams. Reduces the native-thread shutdown races
+                # that were producing segfaults on the sleep path.
+                _kill_active_tts()
+                try:
+                    mic.close()
+                except Exception as e:
+                    logger.warning(f"mic.close: {e}")
+                try:
+                    spk.close()
+                except Exception as e:
+                    logger.warning(f"spk.close: {e}")
 
             if _handoff["project"]:
                 proj = _handoff["project"]
@@ -1784,6 +1834,19 @@ async def main():
                 # pre-sleep session). On Ctrl+C inside the listener,
                 # break out for real.
                 _sleep_requested = False
+                # Shut Playwright down before the wake listener spins
+                # up faster-whisper's native model load. Two native
+                # subsystems tearing up/down concurrently is the most
+                # likely cause of the segfaults on the sleep path.
+                try:
+                    from browser import is_running, stop_browser
+                    if is_running():
+                        await asyncio.to_thread(stop_browser)
+                except Exception as e:
+                    logger.warning(f"browser stop on sleep: {e}")
+                # Drop resumption handle — waking is a genuine fresh
+                # conversation, not a continuation.
+                _session_handle = None
                 woke = await asyncio.to_thread(_wait_for_wake_word, pa)
                 if not woke:
                     break
@@ -1791,14 +1854,14 @@ async def main():
                 logger.info("wake — starting fresh Gemini session")
                 continue
 
-            if reconnect_on_1011:
-                # Silent reopen after a server-side 1011. Short
-                # backoff so we don't hot-loop if the backend is
-                # temporarily unhappy; the outer while True opens a
-                # fresh WebSocket with zero shared state, same as
-                # after a sleep cycle.
-                print("  Reconnecting to Gemini Live...")
-                await asyncio.sleep(1.0)
+            if reconnect_requested:
+                # Silent reopen path — covers both server-initiated
+                # closures (1011/1008/ConnectionClosed) and our own
+                # proactive rotation before the 15-min session cap.
+                # The last session_resumption_update.new_handle is
+                # passed back to the server on reconnect so the
+                # conversation continues without visible interruption.
+                await asyncio.sleep(1.0)  # short backoff for sick backends
                 continue
 
             break

@@ -20,12 +20,13 @@ Usage:
 
 Invariants:
     • eval/run.py does NOT modify any slim code.
-    • SYSTEM_PROMPT, TOOL_DECLARATIONS, handle_tool, ACTION_GATE, and
-      _transcript_has_trigger are imported from jarvis_slim — so
-      what we test is exactly what slim dispatches in production.
-    • Each case uses a fresh Gemini Live session (no state bleed).
-    • The trigger-word gate is applied in-harness, same logic as
-      slim's receive loop, so gated false-positives are caught.
+    • SYSTEM_PROMPT, TOOL_DECLARATIONS, and handle_tool are imported
+      from jarvis_slim — so what we test is exactly what slim
+      dispatches in production.
+    • Each case uses a fresh Gemini session (no state bleed).
+    • No trigger-word gate: slim no longer gates on transcript content.
+      Routing is handled entirely by the C21 action-schema on the
+      underlying model.
 """
 
 from __future__ import annotations
@@ -58,8 +59,6 @@ import jarvis_slim  # noqa: E402
 from jarvis_slim import (  # noqa: E402
     SYSTEM_PROMPT,
     TOOL_DECLARATIONS,
-    ACTION_GATE,
-    _transcript_has_trigger,
     handle_tool,
 )
 
@@ -144,7 +143,6 @@ async def run_case(client, case: dict, dry_run: bool = False) -> dict:
         "tool_args": {},
         "assistant_text": "",
         "handler_result": "",
-        "gate_blocked": False,
         "error": None,
     }
 
@@ -181,16 +179,7 @@ async def run_case(client, case: dict, dry_run: bool = False) -> dict:
                 result["tool_args"] = args
                 action = (args.get("action") or "").lower().strip()
 
-                # Trigger-word gate — same logic slim applies in its
-                # receive loop.
-                gated = action in ACTION_GATE
-                has_trigger = _transcript_has_trigger(case["utterance"])
-                if gated and case["utterance"] and not has_trigger:
-                    result["gate_blocked"] = True
-                    result["handler_result"] = (
-                        "No trigger word heard. Say jarvis or nexus first."
-                    )
-                elif dry_run:
+                if dry_run:
                     result["handler_result"] = f"[dry-run] would call {action}"
                 else:
                     try:
@@ -253,7 +242,6 @@ async def sweep(cases: list[dict], *, with_browse: bool, dry_run: bool,
                     "tool_args": {},
                     "assistant_text": "",
                     "handler_result": "",
-                    "gate_blocked": False,
                 }
             r["rep"] = rep
             r["scoring"] = score_case(case, r, judge=judge)
@@ -386,8 +374,7 @@ def write_scorecard(cases: list[dict], results: list[dict], out_path: Path) -> d
                 f"- Actual: action=`{args.get('action')}`, "
                 f"query=`{args.get('query')}`, "
                 f"session=`{args.get('session')}`, "
-                f"latency=`{example.get('latency_ms')}ms`, "
-                f"gate_blocked=`{example.get('gate_blocked')}`"
+                f"latency=`{example.get('latency_ms')}ms`"
             )
             if example.get("assistant_text"):
                 lines.append(f"- Text: `{example['assistant_text'][:200]}`")
