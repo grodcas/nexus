@@ -75,7 +75,11 @@ TOOL_DECLARATIONS = [
             properties={
                 "action": types.Schema(
                     type=types.Type.STRING,
-                    description="One of: browse, search, calendar, email, reminders, briefing, documents, code, github, window, sleep.",
+                    description=(
+                        "search: web. documents: my files. browse: open site. "
+                        "sleep: 'sleep' / 'goodbye' / 'bye'. "
+                        "calendar, email, reminders, briefing, window, code, github."
+                    ),
                 ),
                 "query": types.Schema(
                     type=types.Type.STRING,
@@ -264,8 +268,11 @@ def _search_worktree(query):
     return "\n".join(results) if results else "Nothing found."
 
 
+BROWSE_TIMEOUT_SEC = 45  # hard cap on the inner Claude nav agent
+
+
 def _run_nav_claude(destination, goal):
-    """Run Claude Code for browser navigation."""
+    """Run Claude Code for browser navigation. Hard-killed at BROWSE_TIMEOUT_SEC."""
     nav_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "nav.py"))
     venv_python = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "venv", "bin", "python3"))
 
@@ -273,8 +280,9 @@ def _run_nav_claude(destination, goal):
         f"Navigate the browser to: {destination}\nGoal: {goal}\n\n"
         f"Use: {venv_python} {nav_script} <cmd>\n"
         f"Commands: state, goto <url>, click \"text\", type \"field\" \"value\", press Enter, scroll down\n"
-        "Start with state. Prefer direct URLs over clicking when the site "
-        "exposes a stable URL for the section you need.\n"
+        "Prefer a direct URL. Budget: max 4 commands total. Do not loop "
+        "between sites. If the first page doesn't have the answer, stop "
+        "and report 'Not found on that page'.\n"
         "\n"
         "FINAL RESPONSE: write 2 to 4 full sentences that directly answer the "
         "user's question with the actual facts you found on the page. Include "
@@ -288,6 +296,7 @@ def _run_nav_claude(destination, goal):
 
     cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json",
            "--dangerously-skip-permissions", "-p", prompt]
+    proc = None
     try:
         spawn_start = time.perf_counter()
         proc = subprocess.Popen(cmd, cwd=os.path.dirname(__file__),
@@ -297,8 +306,9 @@ def _run_nav_claude(destination, goal):
 
         result_text = ""
         first_token_logged = False
+        timed_out = False
         start = time.time()
-        while proc.poll() is None and time.time() - start < 90:
+        while proc.poll() is None and time.time() - start < BROWSE_TIMEOUT_SEC:
             line = proc.stdout.readline()
             if not line:
                 break
@@ -318,11 +328,25 @@ def _run_nav_claude(destination, goal):
                         result_text = r
             except json.JSONDecodeError:
                 pass
-        proc.wait(timeout=5)
+        if proc.poll() is None:
+            timed_out = True
+            proc.kill()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
         log_event(phase="browse.claude_total",
-                  duration_ms=round((time.time() - start) * 1000, 2))
+                  duration_ms=round((time.time() - start) * 1000, 2),
+                  timed_out=timed_out)
+        if timed_out and not result_text:
+            return "Browsing took too long. Tell the user the page is taking long and ask if they want to keep trying."
         return result_text or "Navigation done."
     except Exception as e:
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return f"Error: {str(e)[:100]}"
 
 
@@ -492,9 +516,37 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
             _sleep_requested = True
             return "Goodbye.", False
 
-        elif action in ("browse", "search", "navigate"):
-            # No hardcoded destination map — pass the user's query through.
-            # The inner nav agent decides where to go from the query itself.
+        elif action == "search":
+            # Fast path — open Google for the query, no inner Claude.
+            # Gemini answers the user from its own knowledge; the
+            # browser page is there if the user wants to read more.
+            # This avoids the Google ↔ Wikipedia navigation loop and
+            # the Claude subprocess spawn latency.
+            import urllib.parse
+            try:
+                with timed("search.ensure_browser"):
+                    from browser import ensure_browser, send_command
+                    ensure_browser()
+                q = (query or "").strip()
+                url = (
+                    f"https://www.google.com/search?q={urllib.parse.quote(q)}"
+                    if q else "https://www.google.com"
+                )
+                with timed("search.goto"):
+                    send_command({"action": "goto", "url": url})
+            except Exception as e:
+                return f"Search error: {str(e)[:100]}", False
+            return (
+                f"Google opened for '{q[:120]}'. Answer the user's "
+                "question now from your own knowledge in 1-2 natural "
+                "spoken sentences. Do not say you searched."
+            ), False
+
+        elif action in ("browse", "navigate"):
+            # Slow path for real site navigation (figma, email,
+            # shopify, facebook ads, a university page, etc). Inner
+            # Claude drives Playwright with a 45s hard timeout so it
+            # cannot loop forever.
             try:
                 with timed("browse.ensure_browser"):
                     from browser import ensure_browser
@@ -503,12 +555,6 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
                 return f"Browser error: {str(e)[:100]}", False
 
             result = _run_nav_claude(query or "google", query)
-            # Frame the findings so Gemini relays them in a natural
-            # spoken sentence instead of just saying "done" or
-            # dropping the user on a page without an explanation.
-            # This framing lives in the tool_response, NOT the system
-            # prompt, so the Gemini budget discipline is preserved —
-            # these extra tokens only count when search is used.
             framed = (
                 f"Findings from the web for the user's request "
                 f"'{(query or '').strip()[:120]}':\n\n"
@@ -658,6 +704,21 @@ except ValueError:
     _MIC_GATE_TAIL_S = 0.4
 _last_gemini_audio_ts: float = 0.0
 
+# Tool-in-flight gate.
+#
+# Gemini Live function calling is documented as sequential: "execution
+# pauses until the results of each function call are available." In
+# practice, streaming real mic audio while a tool is running triggers
+# server-side 1011 closures (see google/adk-python#3918 and the
+# Google AI dev forum threads on random 1011 during tool_response).
+#
+# This flag gates the mic the same way _mic_should_be_muted does when
+# Gemini is speaking. Set True just before dispatching handle_tool,
+# cleared just after send_tool_response succeeds. The existing silence
+# keepalive path still fires in send_audio(), which keeps the session
+# alive without feeding the server real audio it isn't expecting.
+_tool_in_flight: bool = False
+
 
 def _mic_should_be_muted() -> bool:
     """
@@ -668,6 +729,10 @@ def _mic_should_be_muted() -> bool:
         return False
     # Local TTS playing → always mute (briefing / ack lines).
     if _ACTIVE_TTS is not None and _ACTIVE_TTS.poll() is None:
+        return True
+    # A tool is running — documented pattern is "execution pauses."
+    # Keep the session warm with silence; no real mic.
+    if _tool_in_flight:
         return True
     # Within tail window after Gemini's last audio chunk → mute.
     if _last_gemini_audio_ts > 0.0:
@@ -730,8 +795,11 @@ _CHOSEN_VOICE: str | None = None
 # lines are deliberately generic (no app names, no segment language —
 # rule #5 from JARVIS_GUIDE).
 ACK_LINES: dict[str, str] = {
+    # search has no ack — it's a fast direct goto and Gemini speaks
+    # the answer from its own knowledge. Any local ack would collide
+    # with Gemini's reply. Browse keeps its ack because the inner
+    # Claude subprocess can take several seconds.
     "browse":   "On it.",
-    "search":   "Searching.",
     "navigate": "On it.",
 }
 
@@ -860,8 +928,13 @@ _TRIGGER_FUZZY: tuple[str, ...] = _COMMAND_TRIGGERS
 TRIGGER_TOKENS: set[str] = set(_COMMAND_TRIGGERS)
 
 ACTION_GATE: set[str] = {
-    "browse", "search", "navigate", "documents", "window", "code", "connect",
-    "briefing", "calendar", "email", "reminders", "github",
+    # Only the cost-expensive / session-changing actions stay gated.
+    # Reads (calendar, email, briefing, reminders, documents, github)
+    # and reversible actions (search, browse, window, navigate) flow
+    # freely — Gemini routes them at 100% on the C21 schema battery,
+    # and a spurious read is cheap. The "least me the windows"
+    # homophone failure mode goes away with `window` ungated.
+    "code", "connect", "sleep",
 }
 
 # Stateful trust window (Finding #1 from plan2_baseline.md).
@@ -1352,19 +1425,8 @@ async def main():
 
     print_budget()
 
-    # Phase 1B — pre-warm browser on app start.
-    # ensure_browser is idempotent; firing it now means the first
-    # browse/search call of the day finds the browser already up.
-    # Failures are logged and swallowed — the in-handle_tool fallback
-    # path still works.
-    async def _prewarm_browser():
-        try:
-            from browser import ensure_browser
-            await asyncio.to_thread(ensure_browser)
-            logger.info("Browser pre-warmed")
-        except Exception as e:
-            logger.warning(f"Browser pre-warm failed (continuing): {e}")
-    asyncio.create_task(_prewarm_browser())
+    # Browser is launched lazily on the first browse/search call —
+    # Chrome should not appear until the user actually asks for it.
 
     # Pre-warm the TTS voice lookup — first call to `say -v ?` takes
     # ~140ms; doing it here makes the first real briefing instant.
@@ -1416,6 +1478,8 @@ async def main():
             _handoff["path"] = None
             _last_gate_pass_ts = 0.0
             _last_gemini_audio_ts = 0.0  # mic gate starts open
+            global _tool_in_flight
+            _tool_in_flight = False  # no stale tool gate on new session
             _kill_active_tts()  # no leftover say/afplay from prior run
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
@@ -1423,57 +1487,39 @@ async def main():
             spk = pa.open(format=pyaudio.paInt16, channels=1, rate=RECV_RATE,
                           output=True, frames_per_buffer=4096)
 
+            # Set by the 1011-detection block below; triggers a silent
+            # reconnect via `continue` in the outer while loop.
+            reconnect_on_1011 = False
+
             try:
                 async with client.aio.live.connect(
-                    model="gemini-2.5-flash-native-audio-preview-12-2025",
+                    # gemini-3.1-flash-live-preview is Google's
+                    # documented replacement for the deprecated
+                    # 2.5-native-audio-preview. Same audio pricing,
+                    # proper function-calling support, known-stable
+                    # for production Live API usage.
+                    model="gemini-3.1-flash-live-preview",
                     config=config,
                 ) as session:
 
-                    # Pre-compute one chunk of silence (all zeros)
-                    # for the mic-gate keepalive path below. 16-bit
-                    # mono PCM at 16 kHz, same shape as real mic
-                    # chunks so the server can't tell the difference
-                    # at the framing layer. Gemini's VAD ignores
-                    # silence so it never triggers a response or
-                    # feeds into the feedback loop.
-                    silence_chunk = b"\x00" * (CHUNK * 2)
-                    last_sent_ts = 0.0
-
                     async def send_audio():
-                        nonlocal last_sent_ts
+                        # Mic forwarding only. When the gate is
+                        # closed (Gemini speaking, local TTS, or a
+                        # tool in flight) we simply don't send —
+                        # the SDK/server handles idle periods on
+                        # their own. The previous silence-keepalive
+                        # was a home-grown "fix 1011" that wasn't
+                        # part of the documented protocol and
+                        # appears to have been contributing to the
+                        # same class of failures.
                         loop = asyncio.get_event_loop()
                         while True:
                             data = await loop.run_in_executor(None, mic.read, CHUNK, False)
-                            now = time.monotonic()
-                            # Mic gate — suppress live mic audio
-                            # while Gemini or local TTS is
-                            # speaking so the mic doesn't echo
-                            # its own voice back into the Live
-                            # session (feedback loop fix).
                             if _mic_should_be_muted():
-                                # Keepalive: if the gate has been
-                                # closed for >500 ms without any
-                                # outbound frame, push a silent
-                                # chunk so the server sees the
-                                # stream is alive. Prevents
-                                # "keepalive ping timeout" 1011s
-                                # during long tool calls (browse
-                                # inner Claude subprocess takes
-                                # 15-25s and the mic gate would
-                                # otherwise go fully idle).
-                                if (now - last_sent_ts) > 0.5:
-                                    await session.send_realtime_input(
-                                        audio=types.Blob(
-                                            data=silence_chunk,
-                                            mime_type="audio/pcm;rate=16000",
-                                        )
-                                    )
-                                    last_sent_ts = now
                                 continue
                             await session.send_realtime_input(
                                 audio=types.Blob(data=data, mime_type="audio/pcm;rate=16000")
                             )
-                            last_sent_ts = now
 
                     # Phase 1E — rolling transcript buffer for the
                     # current user turn. Reset whenever the turn ends.
@@ -1579,9 +1625,23 @@ async def main():
                                                     f"(transcript={transcript_snapshot!r})"
                                                 )
 
-                                        result, is_long = await asyncio.to_thread(
-                                            handle_tool, action, query, sess_choice
-                                        )
+                                        # Pause outbound mic for the full
+                                        # tool-dispatch-to-response window.
+                                        # Gemini Live expects the stream to
+                                        # go quiet here; flooding audio during
+                                        # a tool call triggers 1011 server
+                                        # closures. Cleared in a finally at the
+                                        # end of this tool_call branch so a
+                                        # handle_tool raise can't wedge the mic.
+                                        global _tool_in_flight
+                                        _tool_in_flight = True
+                                        try:
+                                            result, is_long = await asyncio.to_thread(
+                                                handle_tool, action, query, sess_choice
+                                            )
+                                        except Exception:
+                                            _tool_in_flight = False
+                                            raise
 
                                         if is_long:
                                             # Fire [cached intro] → [body]
@@ -1628,6 +1688,8 @@ async def main():
                                                 response={"result": gemini_result},
                                             )]
                                         )
+                                        # Tool cycle fully done — open mic.
+                                        _tool_in_flight = False
 
                                         if _handoff["project"]:
                                             # Let the goodbye line play, then exit Gemini.
@@ -1649,6 +1711,8 @@ async def main():
                             [send_task, recv_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
+                        # Cancel the survivor first — tighter shutdown
+                        # order, fewer spurious socket writes.
                         for t in pending:
                             t.cancel()
                         for t in pending:
@@ -1656,9 +1720,43 @@ async def main():
                                 await t
                             except (asyncio.CancelledError, Exception):
                                 pass
+                        # Observe exceptions on the done task(s). If
+                        # we skip this, Python logs "Task exception
+                        # was never retrieved" at GC time and the
+                        # real error (e.g. 1011) is invisible.
+                        for t in done:
+                            try:
+                                await t
+                            except (asyncio.CancelledError, KeyboardInterrupt):
+                                raise
+                            except Exception as e:
+                                msg = str(e)
+                                if "1011" in msg or "ConnectionClosed" in type(e).__name__:
+                                    logger.warning(
+                                        f"Live session closed with 1011 "
+                                        f"({type(e).__name__}): {msg[:120]} — reconnecting"
+                                    )
+                                    reconnect_on_1011 = True
+                                else:
+                                    logger.error(
+                                        f"session task exception ({type(e).__name__}): {msg[:200]}"
+                                    )
                     except (KeyboardInterrupt, asyncio.CancelledError):
                         send_task.cancel()
                         recv_task.cancel()
+            except Exception as e:
+                # `async with client.aio.live.connect(...)` itself can
+                # raise on the way in or on clean exit if the socket
+                # closed mid-handshake. Treat 1011 the same as above.
+                msg = str(e)
+                if "1011" in msg or "ConnectionClosed" in type(e).__name__:
+                    logger.warning(
+                        f"Live connect closed with 1011 "
+                        f"({type(e).__name__}): {msg[:120]} — reconnecting"
+                    )
+                    reconnect_on_1011 = True
+                else:
+                    raise
             finally:
                 mic.close()
                 spk.close()
@@ -1691,6 +1789,16 @@ async def main():
                     break
                 print("\n  Awake. New Gemini session starting.\n")
                 logger.info("wake — starting fresh Gemini session")
+                continue
+
+            if reconnect_on_1011:
+                # Silent reopen after a server-side 1011. Short
+                # backoff so we don't hot-loop if the backend is
+                # temporarily unhappy; the outer while True opens a
+                # fresh WebSocket with zero shared state, same as
+                # after a sleep cycle.
+                print("  Reconnecting to Gemini Live...")
+                await asyncio.sleep(1.0)
                 continue
 
             break
