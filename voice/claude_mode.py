@@ -3,21 +3,23 @@
 Claude coding mode — direct voice-to-Claude Code with Claudia API assist.
 
 States:
-    IDLE              — waiting for "hey claude" or "hey claudia"
+    IDLE              — waiting for a trigger
     RECORDING_CLAUDE  — buffering speech for Claude Code
     RECORDING_CLAUDIA — buffering speech for Claudia API
     WAITING_CLAUDE    — Claude Code subprocess running
     WAITING_CLAUDIA   — Claudia API call in flight
 
-Keywords:
-    "hey claude"      — start recording for Claude Code
-    "hey claudia"     — start recording for Claudia (needs prior Claude output)
-    "over, claude"    — stop recording, send to Claude Code
-    "over, claudia"   — stop recording, send to Claudia
-    "claude stop"     — interrupt Claude's TTS playback
-    "claudia stop"    — interrupt Claudia's TTS playback
+Keywords (days of the week — STT-robust, see audio.py header):
+    "friday"          — toggle Claude Code (open recording → submit)
+    "wednesday"       — toggle Claudia (open recording → submit)
+    "stop friday"     — interrupt Claude's TTS playback
+    "stop wednesday"  — interrupt Claudia's TTS playback
     "jarvis"          — exit to Gemini mode (session stays alive)
     "close session"   — kill session, exit to Gemini
+
+Single-utterance form also works: "friday do X friday" enters and
+exits the recording in one breath — detected by counting trigger
+occurrences in the transcript.
 """
 
 import asyncio
@@ -35,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio import (
     detect_keyword,
     has_keyword,
+    count_keyword,
     strip_keyword,
     transcribe,
     speak,
@@ -341,7 +344,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
     # If there's a pending result from background work, deliver it
     if claude.status == "done" and claude.result_text:
         last_claude_output = claude.result_text
-        await asyncio.to_thread(lambda: subprocess.run(["say", f"Connected to {project}. Result from earlier."], timeout=5))
+        await asyncio.to_thread(speak, f"Connected to {project}. Result from earlier.")
         interrupted = await asyncio.to_thread(speak, last_claude_output)
         claude.status = "idle"
         if claude.session_id:
@@ -350,7 +353,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                                     last_claude_output[:100])
     else:
         # Quick local TTS — no API call delay
-        await asyncio.to_thread(lambda: subprocess.run(["say", f"Connected to {project}"], timeout=5))
+        await asyncio.to_thread(speak, f"Connected to {project}")
 
     while True:
         # ── IDLE ──────────────────────────────────────────────────────
@@ -367,6 +370,11 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                                             last_claude_output[:100])
                 continue
 
+            # 0.3s silence keeps the trigger snappy. The real STT
+            # reliability lever is the minimum-speech-duration guard
+            # inside record_speech — it rejects noise blips that
+            # previously produced Whisper hallucinations like
+            # "thanks for watching!".
             audio = await asyncio.to_thread(record_speech, 0.3, 5, 5.0)
             if audio is None:
                 continue
@@ -377,24 +385,29 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
             if not text or len(text.strip()) < 2:
                 continue
 
-            # Check for keywords independently — both can appear in one utterance
-            got_hey_claude = has_keyword(text, "hey_claude")
-            got_hey_claudia = has_keyword(text, "hey_claudia")
-            got_over_claude = has_keyword(text, "over_claude")
-            got_over_claudia = has_keyword(text, "over_claudia")
+            # Cancel keywords take precedence over the triggers because
+            # "stop friday" contains "friday" as a substring — without
+            # this check, "stop friday" in IDLE would enter recording.
+            if has_keyword(text, "stop_claude") or has_keyword(text, "stop_claudia"):
+                # Nothing to cancel in IDLE — ignore silently.
+                continue
+
+            # Trigger words toggle: one hearing opens recording,
+            # two hearings in one utterance = full single-shot prompt.
+            claude_hits = count_keyword(text, "claude_trigger")
+            claudia_hits = count_keyword(text, "claudia_trigger")
             keyword = detect_keyword(text)
 
-            if got_hey_claude:
+            if claude_hits >= 1:
                 if claude.is_busy:
                     await asyncio.to_thread(speak, "Hold on, Claude is still working on it.")
                     continue
 
-                # Strip "hey claude" to get the rest
-                remaining = strip_keyword(text, "hey_claude")
+                remaining = strip_keyword(text, "claude_trigger").strip()
 
-                if got_over_claude and remaining and len(remaining) > 3:
-                    # Full command in one utterance: "Hey Claude, do X, over Claude"
-                    prompt = strip_keyword(remaining, "over_claude").strip()
+                if claude_hits >= 2 and remaining and len(remaining) > 3:
+                    # Full command in one utterance: "friday do X friday"
+                    prompt = strip_keyword(remaining, "claude_trigger").strip()
                     if prompt:
                         logger.info(f"Single-utterance prompt: '{prompt}'")
                         await asyncio.to_thread(play_ack)
@@ -403,7 +416,8 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                     else:
                         await asyncio.to_thread(speak, "I didn't catch a prompt.")
                 else:
-                    # Just "Hey Claude" or "Hey Claude, start of prompt..."
+                    # Just "friday" or "friday, start of prompt..." — open
+                    # recording, next "friday" will submit.
                     state = State.RECORDING_CLAUDE
                     buffer = []
                     if remaining and len(remaining) > 3:
@@ -412,7 +426,7 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                         await asyncio.to_thread(play_greeting)
                 continue
 
-            elif got_hey_claudia:
+            elif claudia_hits >= 1:
                 if not last_claude_output:
                     await asyncio.to_thread(
                         speak, "I don't have context yet. Ask Claude something first."
@@ -424,11 +438,10 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
 
                 state = State.RECORDING_CLAUDIA
                 buffer = []
+                remaining = strip_keyword(text, "claudia_trigger").strip()
 
-                remaining = strip_keyword(text, "hey_claudia")
-
-                if got_over_claudia and remaining and len(remaining) > 3:
-                    question = strip_keyword(remaining, "over_claudia").strip()
+                if claudia_hits >= 2 and remaining and len(remaining) > 3:
+                    question = strip_keyword(remaining, "claudia_trigger").strip()
                     if question:
                         buffer.append(question)
                         logger.info(f"Single-utterance Claudia: '{question}'")
@@ -468,8 +481,19 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
 
             keyword = detect_keyword(text)
 
-            if keyword == "over_claude" or has_keyword(text, "over_claude"):
-                remaining = strip_keyword(text, "over_claude")
+            # "stop friday" — cancel recording, drop buffer. Checked
+            # BEFORE the submit keyword because "stop friday" contains
+            # the literal word "friday" and would otherwise submit.
+            if has_keyword(text, "stop_claude"):
+                logger.info(f"Claude recording cancelled; dropped {len(buffer)} buffered lines")
+                buffer = []
+                state = State.IDLE
+                await asyncio.to_thread(speak, "Cancelled.")
+                continue
+
+            # Second "friday" hearing → submit buffered prompt.
+            if has_keyword(text, "claude_trigger"):
+                remaining = strip_keyword(text, "claude_trigger").strip()
                 if remaining and len(remaining) > 3:
                     buffer.append(remaining)
                 prompt = " ".join(buffer)
@@ -504,8 +528,17 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
 
             keyword = detect_keyword(text)
 
-            if keyword == "over_claudia":
-                remaining = strip_keyword(text, "over_claudia")
+            # "stop wednesday" — cancel Claudia recording, drop buffer.
+            if has_keyword(text, "stop_claudia"):
+                logger.info(f"Claudia recording cancelled; dropped {len(buffer)} buffered lines")
+                buffer = []
+                state = State.IDLE
+                await asyncio.to_thread(speak, "Cancelled.")
+                continue
+
+            # Second "wednesday" hearing → submit buffered question.
+            if has_keyword(text, "claudia_trigger"):
+                remaining = strip_keyword(text, "claudia_trigger").strip()
                 if remaining and len(remaining) > 3:
                     buffer.append(remaining)
                 question = " ".join(buffer)
@@ -544,12 +577,21 @@ async def run_claude_mode(project: str, session_choice: str, project_path: str) 
                 state = State.IDLE
                 continue
 
-            # Listen briefly while waiting — catch "jarvis" or tell user to wait
+            # Listen briefly while waiting — catch "stop friday", "jarvis",
+            # or a progress query.
             audio = await asyncio.to_thread(record_speech, 1.0, 3.0, 3.0)
             if audio is not None:
                 text = await asyncio.to_thread(transcribe, audio)
                 logger.info(f"[WAIT_CLAUDE] {text}")
                 kw = detect_keyword(text)
+                if has_keyword(text, "stop_claude"):
+                    # Abort the running subprocess and return to IDLE.
+                    logger.info("Claude run aborted by user")
+                    claude.kill()
+                    claude.status = "idle"
+                    state = State.IDLE
+                    await asyncio.to_thread(speak, "Cancelled.")
+                    continue
                 if kw == "jarvis":
                     # Exit but keep Claude running in background
                     return _exit_to_jarvis()

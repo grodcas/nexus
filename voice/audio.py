@@ -33,29 +33,33 @@ ACK_CACHE_DIR = os.path.expanduser("~/.nexus/audio_cache")
 # Keyword detection
 # =============================================================================
 
-# Order matters — check longer/more specific patterns first
+# Trigger words use days of the week: "friday" for Claude Code and
+# "wednesday" for Claudia. Rationale:
+#
+#   - Top-500 English words, heavy in STT training data — Whisper
+#     small transcribes both with near-perfect accuracy, unlike the
+#     proper nouns "Claude" / "Claudia" which it routinely mangles
+#     ("cloud", "claud", "clone", "glob"...).
+#   - Sharp unambiguous phonemes (/ˈfraɪ.deɪ/, /ˈwɛnz.deɪ/) and no
+#     substring of any common word.
+#   - Each trigger toggles: first hearing opens the recording, second
+#     closes it and submits. No need for paired "hey/over" words.
+#
+# Order matters — longer/compound patterns checked first so
+# "stop friday" is detected as `stop_claude`, not `claude_trigger`.
 _KEYWORD_ORDER = [
-    "over_claudia", "over_claude",
     "stop_claudia", "stop_claude",
-    "hey_claudia", "hey_claude",
+    "claudia_trigger", "claude_trigger",
     "close_session", "jarvis",
 ]
 
 _KEYWORD_PATTERNS = {
-    "hey_claude":     ["hey claude", "hey cloud", "hey claud"],
-    "hey_claudia":    ["hey claudia", "hey cloudia"],
-    "over_claude":    ["over claude", "over cloud", "overcloud", "overclone",
-                       "over claud", "over clone", "over, claud",
-                       "over club", "overglot", "over clod", "over glob",
-                       "claude over", "cloud over", "clod over", "cloth over",
-                       "claud over", "clone over", "club over", "glob over"],
-    "over_claudia":   ["over claudia", "over cloudia", "overcloudia",
-                       "claudia over", "cloudia over"],
-    "stop_claude":    ["claude stop", "stop claude", "cloud stop", "stop cloud",
-                       "claud stop", "stop claud"],
-    "stop_claudia":   ["claudia stop", "stop claudia", "cloudia stop", "stop cloudia"],
-    "jarvis":         ["jarvis", "yervis", "yarvis", "charvis"],
-    "close_session":  ["close session", "close the session"],
+    "claude_trigger":  ["friday", "fry day", "fri day"],
+    "claudia_trigger": ["wednesday", "wensday", "wens day", "windsday"],
+    "stop_claude":     ["stop friday", "friday stop"],
+    "stop_claudia":    ["stop wednesday", "wednesday stop"],
+    "jarvis":          ["jarvis", "yervis", "yarvis", "charvis"],
+    "close_session":   ["close session", "close the session"],
 }
 
 
@@ -83,6 +87,22 @@ def has_keyword(text: str, keyword_key: str) -> bool:
         if pattern in norm:
             return True
     return False
+
+
+def count_keyword(text: str, keyword_key: str) -> int:
+    """
+    Count how many times a keyword appears in `text`. Used by the
+    toggle state machine to detect the single-utterance form
+    ("friday do X friday") where the trigger opens and closes the
+    recording in one breath.
+    """
+    import re
+    norm = text.lower()
+    for ch in ",.!?;:":
+        norm = norm.replace(ch, "")
+    norm = " ".join(norm.split())
+    regex = r"\b(?:" + "|".join(re.escape(p) for p in _KEYWORD_PATTERNS[keyword_key]) + r")\b"
+    return len(re.findall(regex, norm))
 
 
 def strip_keyword(text: str, keyword_key: str) -> str:
@@ -141,10 +161,19 @@ def transcribe(audio: np.ndarray) -> str:
 
 
 # =============================================================================
-# TTS — Google Cloud Neural2-J
+# TTS — Google Cloud Chirp3-HD-Aoede
+#
+# Same voice + sample rate as jarvis_slim's tts_speak_long so that
+# Claude-mode speech matches the morning-briefing voice users are
+# used to. Neural2-J was the previous default — noticeably lower
+# quality ("bubbles" in the field report). Chirp3 HD is Google's
+# current generation and sounds substantially more natural.
 # =============================================================================
 
 _tts_client = None
+
+_TTS_VOICE = os.environ.get("NEXUS_TTS_CLOUD_VOICE", "en-US-Chirp3-HD-Aoede")
+_TTS_SAMPLE_RATE = 24000  # Chirp3 HD default
 
 
 def get_tts():
@@ -164,11 +193,12 @@ def _synthesize(text: str) -> bytes:
     return get_tts().synthesize_speech(
         input=texttospeech.SynthesisInput(text=text),
         voice=texttospeech.VoiceSelectionParams(
-            language_code="en-US", name="en-US-Neural2-J",
+            language_code="en-US", name=_TTS_VOICE,
         ),
         audio_config=texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            speaking_rate=1.05,
+            sample_rate_hertz=_TTS_SAMPLE_RATE,
+            speaking_rate=1.0,
         ),
     ).audio_content
 
@@ -329,13 +359,24 @@ ACKNOWLEDGMENTS = [
 ]
 
 
+def _voice_tag() -> str:
+    """
+    Short filename-safe tag of the active TTS voice. Included in
+    cache filenames so a voice switch auto-invalidates old WAVs
+    (otherwise e.g. a cache pre-synthesized with Neural2-J keeps
+    playing even after the code switches to Chirp3-HD-Aoede).
+    """
+    return "".join(c for c in _TTS_VOICE.lower() if c.isalnum())
+
+
 def init_ack_cache():
     """Pre-synthesize greeting and acknowledgment phrases to disk cache."""
     os.makedirs(ACK_CACHE_DIR, exist_ok=True)
+    tag = _voice_tag()
     cached = 0
     for prefix, phrases in [("greet", GREETINGS), ("ack", ACKNOWLEDGMENTS)]:
         for i, text in enumerate(phrases):
-            path = os.path.join(ACK_CACHE_DIR, f"{prefix}_{i}.wav")
+            path = os.path.join(ACK_CACHE_DIR, f"{prefix}_{i}_{tag}.wav")
             if not os.path.exists(path):
                 try:
                     audio = _synthesize(text)
@@ -345,13 +386,13 @@ def init_ack_cache():
                 except Exception as e:
                     logger.error(f"Failed to cache {prefix}_{i}: {e}")
     if cached:
-        logger.info(f"Cached {cached} phrases")
+        logger.info(f"Cached {cached} phrases ({tag})")
 
 
 def play_greeting():
     """Play a random greeting phrase (blocking — so user hears it before speaking)."""
     idx = random.randint(0, len(GREETINGS) - 1)
-    path = os.path.join(ACK_CACHE_DIR, f"greet_{idx}.wav")
+    path = os.path.join(ACK_CACHE_DIR, f"greet_{idx}_{_voice_tag()}.wav")
     if os.path.exists(path):
         subprocess.run(["afplay", path], timeout=5)
     else:
@@ -361,7 +402,7 @@ def play_greeting():
 def play_ack():
     """Play a random acknowledgment phrase (blocking)."""
     idx = random.randint(0, len(ACKNOWLEDGMENTS) - 1)
-    path = os.path.join(ACK_CACHE_DIR, f"ack_{idx}.wav")
+    path = os.path.join(ACK_CACHE_DIR, f"ack_{idx}_{_voice_tag()}.wav")
     if os.path.exists(path):
         subprocess.run(["afplay", path], timeout=5)
     else:
@@ -372,6 +413,14 @@ def play_ack():
 # =============================================================================
 # Recording — energy-based VAD
 # =============================================================================
+
+# Minimum speech activity before we accept a recording. At 100 ms per
+# chunk, 3 chunks = 300 ms of above-threshold audio. Below this the
+# trigger was almost certainly a noise blip (breath, click, fan) —
+# passing those to Whisper produces empty strings or the classic
+# "thanks for watching!" hallucination and wastes a state transition.
+_MIN_SPEECH_CHUNKS = 3
+
 
 def record_speech(silence_duration: float = SILENCE_DURATION,
                   max_duration: float = MAX_RECORD_DURATION,
@@ -385,7 +434,9 @@ def record_speech(silence_duration: float = SILENCE_DURATION,
         wait_timeout: max seconds to wait for speech to begin. None = max_duration.
 
     Returns:
-        int16 numpy array, or None if no speech detected.
+        int16 numpy array, or None if no real speech detected (either
+        no voice energy at all, or only a brief noise blip below the
+        minimum-speech-duration guard).
     """
     chunk_duration = 0.1  # 100ms
     chunk_samples = int(SAMPLE_RATE * chunk_duration)
@@ -396,11 +447,13 @@ def record_speech(silence_duration: float = SILENCE_DURATION,
     audio_chunks = []
     silent_count = 0
     speech_started = False
+    speech_chunk_count = 0  # total chunks with RMS above threshold
     wait_count = 0
 
     stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16",
                             blocksize=chunk_samples)
     stream.start()
+    logger.info("[mic] ready to talk")
 
     try:
         for _ in range(max_chunks):
@@ -410,6 +463,7 @@ def record_speech(silence_duration: float = SILENCE_DURATION,
 
             if rms > SPEECH_RMS_THRESHOLD:
                 speech_started = True
+                speech_chunk_count += 1
                 silent_count = 0
                 wait_count = 0
             elif speech_started:
@@ -424,7 +478,7 @@ def record_speech(silence_duration: float = SILENCE_DURATION,
         stream.stop()
         stream.close()
 
-    if not speech_started:
+    if not speech_started or speech_chunk_count < _MIN_SPEECH_CHUNKS:
         return None
 
     audio = np.concatenate(audio_chunks).flatten()

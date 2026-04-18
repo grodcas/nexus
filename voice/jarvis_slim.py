@@ -94,7 +94,8 @@ TOOL_DECLARATIONS = [
                     description=(
                         "User's words. "
                         "For documents: keywords only, not a sentence. "
-                        f"For code: project name (one of: {', '.join(PROJECTS.keys())}). "
+                        f"For code: project name (one of: {', '.join(PROJECTS.keys())}) "
+                        "or 'list' for sessions. "
                         "For window: a verb-led command "
                         "('move chrome left', 'maximize iterm', 'close finder', 'list')."
                     ),
@@ -670,6 +671,20 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
 
         elif action in ("code", "connect"):
             project = (query or "").lower().strip()
+            # "list sessions" / "list" / "sessions" — report active
+            # Claude Code sessions without starting a handoff.
+            if project in ("list", "list sessions", "sessions"):
+                try:
+                    from claude_mode import get_all_session_statuses
+                    active = get_all_session_statuses()
+                except Exception:
+                    active = {}
+                if active:
+                    return (
+                        "Active Claude sessions: "
+                        + ", ".join(f"{p} ({s})" for p, s in active.items())
+                    ), False
+                return "No active Claude sessions.", False
             if project not in PROJECTS:
                 return f"Unknown project. Available: {', '.join(PROJECTS.keys())}", False
 
@@ -685,7 +700,12 @@ def handle_tool(action: str, query: str = "", session: str = "") -> tuple[str, b
             _handoff["project"] = project
             _handoff["session"] = choice
             _handoff["path"] = path
-            return f"Switching to Claude coding mode for {project}. Goodbye for now.", False
+            # is_long=True → local TTS speaks the line via Chirp3-HD
+            # directly; Gemini is told "already spoken" and stays
+            # quiet. Gemini was silently dropping this tool_response
+            # ~half the time, so the user never heard the handoff
+            # confirmation.
+            return f"Switching to Claude coding mode for {project}. Goodbye for now.", True
 
         elif action == "github":
             try:
@@ -825,6 +845,12 @@ _SESSION_ROTATE_AFTER_S: float = 12 * 60  # 80% — leaves headroom before GoAwa
 _session_started_at: float = 0.0
 _session_handle: str | None = None
 _rotate_requested: bool = False
+
+# True only while a Gemini Live session is open. The notification
+# watcher uses this to suppress playback during Claude mode or
+# sleep — otherwise a queued notification would fire on top of
+# Claude's own TTS, or during the local wake-word listener.
+_gemini_session_active: bool = False
 
 
 def _is_transient_close(e: Exception) -> bool:
@@ -1461,6 +1487,67 @@ async def main():
             logger.warning(f"Whisper pre-warm failed: {e}")
     asyncio.create_task(_prewarm_whisper())
 
+    # Pre-synthesize claude-mode greetings/acks with the current TTS
+    # voice. Without this, play_greeting falls back to macOS `say`
+    # (the "Darth Vader" voice) when the voice-tagged cache is missing.
+    async def _prewarm_ack_cache():
+        try:
+            from audio import init_ack_cache
+            await asyncio.to_thread(init_ack_cache)
+        except Exception as e:
+            logger.warning(f"Ack cache pre-warm failed: {e}")
+    asyncio.create_task(_prewarm_ack_cache())
+
+    # Background notification watcher — polls queued Claude-mode
+    # completion notifications and plays them via local TTS as soon
+    # as the audio channel is free (no Gemini speech, no tool in
+    # flight, no local TTS already playing). Previously the
+    # notifications only fired on turn_complete, which meant if the
+    # user never spoke to Gemini after a Claude run finished, the
+    # notification was queued and forgotten. This loop runs for the
+    # lifetime of the jarvis process.
+    async def _notification_watcher():
+        while True:
+            await asyncio.sleep(1.0)
+            if not _gemini_session_active:
+                # Claude mode or sleep-mode listener owns the audio —
+                # hold the notification until we're back in Jarvis.
+                continue
+            try:
+                from claude_mode import check_notifications
+                notifs = check_notifications()
+            except Exception as e:
+                logger.warning(f"notification watcher poll failed: {e}")
+                continue
+            if not notifs:
+                continue
+            # Wait only for the two cases that would actually collide
+            # audibly: Gemini currently speaking, or another local TTS
+            # already playing. Tool-in-flight and the mic-gate tail
+            # are silent from the user's side — notifications can
+            # overlap those without stepping on any speech.
+            for _ in range(60):
+                if not _gemini_session_active:
+                    break  # bail if we transitioned out mid-wait
+                tts_busy = _ACTIVE_TTS is not None and _ACTIVE_TTS.poll() is None
+                if not _gemini_speaking and not tts_busy:
+                    break
+                await asyncio.sleep(0.5)
+            if not _gemini_session_active:
+                # Re-queue and retry when Jarvis is active again.
+                from claude_mode import _completed_notifications
+                _completed_notifications[:0] = notifs
+                continue
+            for proj, summary in notifs:
+                text = f"Claude finished on {proj}. {summary[:400]}"
+                logger.info(f"Delivering Claude notification: {proj}")
+                try:
+                    await asyncio.to_thread(tts_speak_long, text, None)
+                    await _wait_for_tts_done()
+                except Exception as e:
+                    logger.warning(f"notification playback failed: {e}")
+    asyncio.create_task(_notification_watcher())
+
     config = types.LiveConnectConfig(
         system_instruction=SYSTEM_PROMPT,
         response_modalities=["AUDIO"],
@@ -1498,11 +1585,12 @@ async def main():
             _handoff["session"] = None
             _handoff["path"] = None
             _last_gemini_audio_ts = 0.0  # mic gate starts open
-            global _tool_in_flight, _session_started_at, _rotate_requested, _session_handle, _gemini_speaking
+            global _tool_in_flight, _session_started_at, _rotate_requested, _session_handle, _gemini_speaking, _gemini_session_active
             _tool_in_flight = False  # no stale tool gate on new session
             _session_started_at = time.monotonic()
             _rotate_requested = False
             _gemini_speaking = False  # no stale speaking flag across sessions
+            _gemini_session_active = True  # watcher may deliver notifications
             _kill_active_tts()  # no leftover say/afplay from prior run
 
             mic = pa.open(format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
@@ -1635,6 +1723,12 @@ async def main():
                                     # buffer drain cleanly.
                                     _gemini_speaking = False
                                     _last_gemini_audio_ts = time.monotonic()
+                                    # (Notifications are delivered by
+                                    # a standalone background watcher
+                                    # now — not tied to turn_complete —
+                                    # so they still fire even if the
+                                    # user doesn't interact with Gemini.)
+
                                     age = time.monotonic() - _session_started_at
                                     if age > _SESSION_ROTATE_AFTER_S:
                                         logger.info(
@@ -1810,6 +1904,13 @@ async def main():
                     spk.close()
                 except Exception as e:
                     logger.warning(f"spk.close: {e}")
+
+            # Mark Gemini session inactive now that its WebSocket
+            # and mic/spk streams are closed. The notification watcher
+            # suppresses playback whenever this flag is False (Claude
+            # mode or sleep) to avoid talking over Claude's TTS or
+            # cutting the wake-word listener.
+            _gemini_session_active = False
 
             if _handoff["project"]:
                 proj = _handoff["project"]
