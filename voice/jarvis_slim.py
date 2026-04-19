@@ -8,11 +8,13 @@ Long tool results bypass Gemini and go straight to TTS.
 """
 
 import asyncio
+import concurrent.futures
 import faulthandler
 import json
 import os
 import re
 import subprocess
+import signal
 import sys
 import threading
 import time
@@ -22,6 +24,18 @@ import time
 # dumps a Python-level stack trace to stderr before the process dies —
 # otherwise we just see "zsh: segmentation fault" with no context.
 faulthandler.enable()
+
+# Silence tqdm progress bars AND kill the tqdm monitor thread. Without
+# this, faster-whisper / HuggingFace download leave 1-2 live monitor
+# threads that contend with CoreAudio/CTranslate2 during the wake
+# listener — they were visible in the segfault trace and add nothing.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
+try:
+    import tqdm as _tqdm
+    _tqdm.tqdm.monitor_interval = 0
+except Exception:
+    pass
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
@@ -813,6 +827,26 @@ _last_gemini_audio_ts: float = 0.0
 # outlives turn_complete by ~100-300 ms.
 _gemini_speaking: bool = False
 
+# Cmd+Shift+J hotkey sets this to a future timestamp; the Gemini
+# receive loop drops any audio chunks while now() < this value, so
+# Gemini's voice goes silent immediately even though the model
+# keeps generating for another second or two. Cleared on the next
+# turn_complete so subsequent responses play normally.
+_drop_gemini_audio_until: float = 0.0
+
+# Cmd+Shift+B sets this, then raises SIGINT so the normal Ctrl+C
+# shutdown path runs (pa.terminate, browser close, Gemini ws close,
+# "Jarvis stopped."). The __main__ block checks this flag after
+# asyncio.run returns and os.execv's a fresh process only if set.
+_reboot_requested: bool = False
+
+# Idle auto-sleep. Updated on tool_call arrival and turn_complete.
+# Watchdog task flips _sleep_requested once idle exceeds the limit
+# so the session rolls into the wake listener instead of burning
+# Gemini time on dead air. Configurable via JARVIS_IDLE_SLEEP_S.
+_last_activity_ts: float = 0.0
+_IDLE_SLEEP_S: float = float(os.getenv("JARVIS_IDLE_SLEEP_S", "120"))
+
 # Tool-in-flight gate.
 #
 # Gemini Live function calling is documented as sequential: "execution
@@ -1039,7 +1073,10 @@ def _transcript_has_trigger(
 # Gemini cost. The speaker is also free — nothing plays until wake.
 
 _SLEEP_WINDOW_S = 2.0       # seconds of audio per whisper call
-_SLEEP_POLL_S = 0.1         # how often to check the transcript buffer
+_SLEEP_HOP_S = 1.0          # slide the window every 1s; any phrase
+                            # up to HOP seconds long is guaranteed to
+                            # land fully inside at least one window
+                            # (no more boundary misses on "wake up").
 
 def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
     """
@@ -1072,7 +1109,10 @@ def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
         voice = _pick_voice()
         if voice:
             cmd += ["-v", voice]
-        cmd.append(f"Sleeping. Say {wake_names} to wake me.")
+        # NB: do NOT include the wake phrase in this line. The
+        # speaker feeds back into the mic; whisper would transcribe
+        # the announcement and trigger an instant self-wake.
+        cmd.append("Going to sleep.")
         subprocess.Popen(
             cmd, stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1090,19 +1130,33 @@ def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
         frames_per_buffer=CHUNK,
     )
     try:
+        from collections import deque
         chunks_per_window = int(SAMPLE_RATE * _SLEEP_WINDOW_S / CHUNK)
-        window: list[bytes] = []
+        chunks_per_hop = max(1, int(SAMPLE_RATE * _SLEEP_HOP_S / CHUNK))
+        # Rolling buffer — keeps the most recent WINDOW_S of audio.
+        # Every HOP_S of new audio we transcribe the entire buffer,
+        # so consecutive windows overlap by (WINDOW_S - HOP_S). Any
+        # phrase ≤ HOP_S is guaranteed to appear fully inside at
+        # least one window — fixes the "wake up straddles a 2s
+        # boundary" miss that the old non-overlapping logic had.
+        buf: deque[bytes] = deque(maxlen=chunks_per_window)
+        chunks_since_last = 0
         while True:
             try:
                 data = mic.read(CHUNK, exception_on_overflow=False)
             except KeyboardInterrupt:
                 return False
-            window.append(data)
-            if len(window) < chunks_per_window:
+            buf.append(data)
+            chunks_since_last += 1
+            # Wait until the buffer is full (first window) AND we've
+            # collected a fresh hop's worth of audio since the last
+            # transcribe.
+            if len(buf) < chunks_per_window:
                 continue
-            # Full 2s window — transcribe and check for trigger.
-            audio_bytes = b"".join(window)
-            window = []
+            if chunks_since_last < chunks_per_hop:
+                continue
+            chunks_since_last = 0
+            audio_bytes = b"".join(buf)
             try:
                 audio_arr = np.frombuffer(audio_bytes, dtype=np.int16)
                 text = transcribe(audio_arr)
@@ -1114,11 +1168,6 @@ def _wait_for_wake_word(pa: "pyaudio.PyAudio") -> bool:
             if _transcript_has_trigger(text, _WAKE_TRIGGERS):
                 logger.info(f"wake phrase heard: {text!r}")
                 return True
-            # Slight breath before the next window so we don't pin a
-            # core if whisper ever returns faster than realtime.
-            # (Unlikely at 2s window / 300-600ms whisper, but cheap.)
-            if _SLEEP_POLL_S > 0:
-                time.sleep(_SLEEP_POLL_S)
     except KeyboardInterrupt:
         return False
     finally:
@@ -1186,6 +1235,11 @@ _ACTION_INTRO: dict[str, tuple[str, str]] = {
     "documents": ("documents_intro", "Let me look."),
 }
 
+# Cached with the same Chirp3-Aoede voice Gemini uses, so the
+# launch/wake cue sounds like jarvis rather than macOS `say`.
+_READY_CUE_KEY = "ready_cue"
+_READY_CUE_TEXT = "Ready, sir."
+
 
 def _cache_key_path(key: str) -> str:
     import hashlib
@@ -1246,6 +1300,7 @@ def _prewarm_phrases() -> None:
     """
     for _, (key, text) in _ACTION_INTRO.items():
         _precache_phrase(key, text)
+    _precache_phrase(_READY_CUE_KEY, _READY_CUE_TEXT)
     logger.info(f"tts cache ready: {len(_CACHED_WAV)} phrases")
 
 
@@ -1455,6 +1510,49 @@ async def main():
     # Browser is launched lazily on the first browse/search call —
     # Chrome should not appear until the user actually asks for it.
 
+    # Global Cmd+Shift+J hotkey — kills any in-flight TTS. Started
+    # early so the user can interrupt even the very first briefing.
+    # The callback handles the two kill paths audio.py can't reach:
+    # the jarvis-owned `say` subprocess (_ACTIVE_TTS) and the Gemini
+    # Live pyaudio output (dropped for a few seconds via a timestamp
+    # flag read by the receive loop).
+    try:
+        from audio import (
+            start_hotkey_listener,
+            register_hotkey_callback,
+            register_reboot_callback,
+        )
+        def _hotkey_stop_all() -> None:
+            global _drop_gemini_audio_until
+            _kill_active_tts()
+            _drop_gemini_audio_until = time.monotonic() + 5.0
+        def _hotkey_reboot() -> None:
+            # Clean reboot = Ctrl+C + relaunch. We set the flag and
+            # raise SIGINT; the asyncio loop's KeyboardInterrupt
+            # handler runs every `finally` block on the way out
+            # (pa.terminate, browser stop, Gemini ws close). The
+            # __main__ entry point sees the flag and execs a fresh
+            # process. Silence TTS immediately so the user isn't
+            # talked over during the shutdown window.
+            global _reboot_requested
+            _reboot_requested = True
+            try:
+                _kill_active_tts()
+            except Exception:
+                pass
+            try:
+                from audio import stop_speaking as _stop
+                _stop()
+            except Exception:
+                pass
+            logger.warning("Reboot: SIGINT → clean shutdown → re-exec")
+            os.kill(os.getpid(), signal.SIGINT)
+        register_hotkey_callback(_hotkey_stop_all)
+        register_reboot_callback(_hotkey_reboot)
+        start_hotkey_listener()
+    except Exception as e:
+        logger.warning(f"Hotkey listener not started: {e}")
+
     # Pre-warm the TTS voice lookup — first call to `say -v ?` takes
     # ~140ms; doing it here makes the first real briefing instant.
     asyncio.create_task(asyncio.to_thread(_pick_voice))
@@ -1627,6 +1725,19 @@ async def main():
                     config=session_config,
                 ) as session:
 
+                    # Dedicated single-worker executor for mic reads.
+                    # Using the default executor meant a cancelled
+                    # send_audio left its blocking mic.read() running
+                    # inside an anonymous worker thread — when the
+                    # main loop then closed the pyaudio stream, the
+                    # still-live worker segfaulted PortAudio. With a
+                    # per-session executor we can shutdown(wait=True)
+                    # in the finally block and guarantee the thread
+                    # has exited mic.read before mic.close() runs.
+                    mic_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="jarvis-mic",
+                    )
+
                     async def send_audio():
                         # Mic forwarding only. When the gate is
                         # closed (Gemini speaking, local TTS, or a
@@ -1639,7 +1750,9 @@ async def main():
                         # same class of failures.
                         loop = asyncio.get_event_loop()
                         while True:
-                            data = await loop.run_in_executor(None, mic.read, CHUNK, False)
+                            data = await loop.run_in_executor(
+                                mic_executor, mic.read, CHUNK, False,
+                            )
                             if _mic_should_be_muted():
                                 continue
                             await session.send_realtime_input(
@@ -1647,7 +1760,7 @@ async def main():
                             )
 
                     async def receive():
-                        global _last_gemini_audio_ts, _session_handle, _rotate_requested, _gemini_speaking
+                        global _last_gemini_audio_ts, _session_handle, _rotate_requested, _gemini_speaking, _drop_gemini_audio_until, _last_activity_ts
                         while True:
                             async for msg in session.receive():
                                 if msg.data:
@@ -1665,6 +1778,11 @@ async def main():
                                     # briefing — the user hears two
                                     # voices at once.
                                     if _ACTIVE_TTS is None or _ACTIVE_TTS.poll() is not None:
+                                        if time.monotonic() < _drop_gemini_audio_until:
+                                            # Cmd+Shift+J hit — drop chunks
+                                            # until the window expires or
+                                            # turn_complete clears it.
+                                            continue
                                         spk.write(msg.data)
                                         # Mark the moment Gemini put
                                         # audio through the speaker so
@@ -1723,6 +1841,8 @@ async def main():
                                     # buffer drain cleanly.
                                     _gemini_speaking = False
                                     _last_gemini_audio_ts = time.monotonic()
+                                    _drop_gemini_audio_until = 0.0
+                                    _last_activity_ts = time.monotonic()
                                     # (Notifications are delivered by
                                     # a standalone background watcher
                                     # now — not tied to turn_complete —
@@ -1745,6 +1865,7 @@ async def main():
                                     # a briefing mid-read with "never
                                     # mind, search for X").
                                     _kill_active_tts()
+                                    _last_activity_ts = time.monotonic()
                                     for fc in msg.tool_call.function_calls:
                                         logger.info(f"Tool call: {fc.name}({dict(fc.args)})")
                                         args = dict(fc.args) if fc.args else {}
@@ -1832,11 +1953,60 @@ async def main():
                                             await asyncio.sleep(1.8)
                                             return
 
+                    # Seed activity timer at session open so we don't
+                    # instantly trip the idle watchdog on a fresh
+                    # connection.
+                    global _last_activity_ts
+                    _last_activity_ts = time.monotonic()
+
+                    async def idle_watchdog():
+                        """Flip _sleep_requested after _IDLE_SLEEP_S
+                        of no tool calls or turn_complete events.
+                        Returning triggers the outer asyncio.wait to
+                        fall through to the clean sleep path — same
+                        exit as the voice 'sleep' command."""
+                        global _sleep_requested
+                        while True:
+                            await asyncio.sleep(10)
+                            idle = time.monotonic() - _last_activity_ts
+                            if idle < _IDLE_SLEEP_S:
+                                continue
+                            # Don't auto-sleep mid-tool or while
+                            # Gemini is mid-response — wait for the
+                            # next turn_complete to roll the timer.
+                            if _tool_in_flight or _gemini_speaking:
+                                continue
+                            if _ACTIVE_TTS is not None and _ACTIVE_TTS.poll() is None:
+                                continue
+                            logger.info(f"auto-sleep: {idle:.0f}s idle")
+                            _sleep_requested = True
+                            return
+
                     send_task = asyncio.create_task(send_audio())
                     recv_task = asyncio.create_task(receive())
+                    idle_task = asyncio.create_task(idle_watchdog())
+                    # Audible "ready to talk" cue in Gemini's own
+                    # voice (Chirp3-HD-Aoede). Pre-synthesized on
+                    # startup via _prewarm_phrases, so playback is
+                    # instant (no synth latency) and matches the
+                    # voice Gemini uses — no jarring switch between
+                    # macOS `say` and cloud TTS.
+                    try:
+                        ready_wav = _CACHED_WAV.get(_READY_CUE_KEY)
+                        if ready_wav and os.path.exists(ready_wav):
+                            _ACTIVE_TTS = _afplay_popen(ready_wav)
+                        else:
+                            # Cache miss (first run before prewarm
+                            # finished, or cloud TTS disabled) —
+                            # fall back to the full cloud-or-say
+                            # path so the user still gets a cue.
+                            tts_speak_long(_READY_CUE_TEXT)
+                        print("  Ready — just talk.\n", flush=True)
+                    except Exception as e:
+                        logger.warning(f"ready cue failed: {e}")
                     try:
                         done, pending = await asyncio.wait(
-                            [send_task, recv_task],
+                            [send_task, recv_task, idle_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         # Cancel the survivor first — tighter shutdown
@@ -1872,6 +2042,7 @@ async def main():
                     except (KeyboardInterrupt, asyncio.CancelledError):
                         send_task.cancel()
                         recv_task.cancel()
+                        idle_task.cancel()
 
                 # Clean rotation — receive() returned without exception
                 # because _rotate_requested was set on a turn boundary
@@ -1896,6 +2067,17 @@ async def main():
                 # streams. Reduces the native-thread shutdown races
                 # that were producing segfaults on the sleep path.
                 _kill_active_tts()
+                # Drain the mic executor BEFORE closing the stream.
+                # shutdown(wait=True) blocks until the in-flight
+                # mic.read() returns naturally (~60ms max at CHUNK=960),
+                # so the worker thread is guaranteed to have released
+                # the PortAudio handle before we tear it down. Without
+                # this the sleep→wake path raced: closed stream + live
+                # read call = segfault.
+                try:
+                    mic_executor.shutdown(wait=True, cancel_futures=True)
+                except Exception as e:
+                    logger.warning(f"mic_executor.shutdown: {e}")
                 try:
                     mic.close()
                 except Exception as e:
@@ -1976,3 +2158,10 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n  Jarvis stopped.\n")
+    if _reboot_requested:
+        # Clean shutdown has completed (all finally blocks ran).
+        # Replace the current interpreter with a fresh jarvis using
+        # the same argv — equivalent to running the launch command
+        # again from the terminal.
+        print("  Rebooting jarvis...\n", flush=True)
+        os.execv(sys.executable, [sys.executable] + sys.argv)

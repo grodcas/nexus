@@ -225,7 +225,7 @@ _current_playback = None  # Current afplay subprocess — killed by hotkey
 
 
 def _play_wav_bytes(audio_bytes: bytes):
-    """Play WAV audio through speakers. Can be killed via Cmd+Shift+J."""
+    """Play WAV audio through speakers. Can be killed via Cmd+Option+S."""
     global _current_playback
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(audio_bytes)
@@ -247,14 +247,30 @@ def stop_speaking():
     if _current_playback and _current_playback.poll() is None:
         _current_playback.kill()
         _current_playback = None
-        logger.info("TTS stopped by hotkey (Cmd+Shift+J)")
+        logger.info("TTS stopped by hotkey (Cmd+Option+S)")
 
 
 _tts_interrupted = False
 
+# Extra hooks fired on Cmd+Option+S in addition to the built-in
+# stop_speaking(). jarvis_slim registers one that kills the
+# `say` subprocess and sets a flag to drop Gemini Live audio.
+_extra_hotkey_callbacks: list = []
+_reboot_callbacks: list = []
+
+
+def register_hotkey_callback(fn) -> None:
+    """Register a fn() to run when Cmd+Option+S fires (stop TTS)."""
+    _extra_hotkey_callbacks.append(fn)
+
+
+def register_reboot_callback(fn) -> None:
+    """Register a fn() to run when Cmd+Shift+B fires (reboot jarvis)."""
+    _reboot_callbacks.append(fn)
+
 
 def speak(text: str):
-    """Speak text via TTS. Blocks until done. Cmd+Shift+J stops it."""
+    """Speak text via TTS. Blocks until done. Cmd+Option+S stops it."""
     global _tts_interrupted
     _tts_interrupted = False
 
@@ -539,33 +555,55 @@ def wait_for_wakeword(timeout: float = 0) -> bool:
 
 
 # =============================================================================
-# Global hotkey — Cmd+Shift+J stops TTS playback
+# Global hotkey — Cmd+Option+S stops TTS playback
 # =============================================================================
 
 def start_hotkey_listener():
-    """Start background listener for Cmd+Shift+J to stop TTS."""
+    """Start background listener for jarvis hotkeys.
+
+    Cmd+Option+S — stop TTS (Gemini + local `say` + afplay).
+    Cmd+Option+B — reboot jarvis (re-exec the process).
+    Cmd+Option is left-hand reachable (thumb holds both modifiers)
+    and rarely bound by macOS or apps — avoids the Cmd+Shift+S =
+    "Save As" conflict across every editor on the system.
+    """
     try:
         from pynput import keyboard
 
-        def on_hotkey():
+        def on_stop():
             global _tts_interrupted
+            # Visible marker so we can confirm the key reached us
+            # (pynput on macOS needs Accessibility perms — if this
+            # line never prints, the OS is filtering the event before
+            # pynput sees it).
+            print("\n[HOTKEY] Cmd+Option+S fired (stop TTS)", flush=True)
+            logger.warning("[HOTKEY] Cmd+Option+S fired (stop TTS)")
             _tts_interrupted = True
             stop_speaking()
+            for cb in list(_extra_hotkey_callbacks):
+                try:
+                    cb()
+                except Exception as e:
+                    logger.warning(f"hotkey callback failed: {e}")
 
-        hotkey = keyboard.HotKey(
-            keyboard.HotKey.parse("<cmd>+<shift>+j"),
-            on_hotkey,
-        )
+        def on_reboot():
+            print("\n[HOTKEY] Cmd+Option+B fired (reboot)", flush=True)
+            logger.warning("[HOTKEY] Cmd+Option+B fired (reboot)")
+            for cb in list(_reboot_callbacks):
+                try:
+                    cb()
+                except Exception as e:
+                    logger.warning(f"reboot callback failed: {e}")
 
-        def on_press(key):
-            hotkey.press(listener.canonical(key))
-
-        def on_release(key):
-            hotkey.release(listener.canonical(key))
-
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener = keyboard.GlobalHotKeys({
+            "<cmd>+<alt>+s": on_stop,
+            "<cmd>+<alt>+b": on_reboot,
+        })
         listener.daemon = True
         listener.start()
-        logger.info("Hotkey listener started: Cmd+Shift+J to stop TTS")
+        logger.info(
+            "Hotkey listener started: Cmd+Option+S = stop TTS, "
+            "Cmd+Option+B = reboot"
+        )
     except Exception as e:
         logger.warning(f"Hotkey listener failed (non-fatal): {e}")
